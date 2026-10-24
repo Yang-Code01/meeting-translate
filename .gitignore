@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 模型（scripts/fetch_models.py 下载）与测试产物
+models/
+spikes/e2e_out.*
+.spike-tmp/
+
+
+# pi 会话与代理产物（含本次对话记录，绝不能提交）
+.pi/
+
+# 工具缓存
+.ruff_cache/
+
+# 本地保留、不公开：设计记录与实验脚本
+docs/
+spikes/
