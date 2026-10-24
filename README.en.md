@@ -4,7 +4,10 @@
 
 [![CI](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml/badge.svg)](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml)
 
-A small Windows desktop tool. It listens to **any meeting app** — the system loopback is treated as *them*, your microphone as *you* — runs speech recognition locally, translates with GitHub Copilot, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
+A small Windows desktop tool with two features:
+
+- **Live meeting translation** — it listens to **any meeting app** (the system loopback is treated as *them*, your microphone as *you*), runs speech recognition locally, translates with GitHub Copilot, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
+- **Selection translation** — select a piece of Japanese text in any application and press **Alt+M**: a popup next to the cursor shows the Chinese translation and the original annotated with furigana. It runs on a separate, pre-warmed session, so it never interrupts a meeting.
 
 No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no virtual audio cable, and speech recognition runs entirely on your CPU — only text is sent to Copilot.
 

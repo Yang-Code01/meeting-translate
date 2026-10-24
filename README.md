@@ -4,7 +4,10 @@
 
 [![CI](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml/badge.svg)](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml)
 
-Windows 桌面小工具。它监听**任意会议软件**的声音——系统环回当作【对方】，麦克风当作【我】——在本地做语音识别，再用 GitHub Copilot 翻译，把日中双语字幕显示在置顶悬浮窗里。会议结束后可以一键生成纪要、待办和清洗后的双语全文。
+Windows 桌面小工具，提供两个功能：
+
+- **会议实时翻译**：监听**任意会议软件**的声音——系统环回当作【对方】，麦克风当作【我】——在本地做语音识别，再用 GitHub Copilot 翻译，把日中双语字幕显示在置顶悬浮窗里；会议结束后可以一键生成纪要、待办和清洗后的双语全文。
+- **划词/句翻译**：在任意程序里选中一段日文，按 **Alt+M**，光标旁弹出中文译文与带假名注音的原文。它跑在一条独立且预先预热的会话上，不会打断正在进行的会议翻译。
 
 不绑定会议平台（Teams / Zoom / Webex / Meet / 腾讯会议都行），不需要虚拟声卡，语音识别全程在本地 CPU 上跑，只有文本会发往 Copilot。
 
