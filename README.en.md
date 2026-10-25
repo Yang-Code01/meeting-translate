@@ -6,7 +6,7 @@
 
 A small Windows desktop tool with two features:
 
-- **Live meeting translation** — it listens to **any meeting app** (the system loopback is treated as *them*, your microphone as *you*), runs speech recognition locally, translates with GitHub Copilot, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
+- **Live meeting translation** — it listens to **any meeting app** (the system loopback is treated as *them*, your microphone as *you*), runs speech recognition locally, translates with GitHub Copilot or your own OpenAI-compatible endpoint, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
 - **Selection translation** — select a piece of Japanese text in any application and press **Alt+M**: a popup next to the cursor shows the Chinese translation and the original annotated with furigana. It runs on a separate, pre-warmed session, so it never interrupts a meeting.
 
 No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no virtual audio cable, and speech recognition runs entirely on your CPU — only text is sent to Copilot.
@@ -16,7 +16,7 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no
 | Item | Requirement |
 |---|---|
 | OS | Windows 10 / 11 (uses WASAPI loopback capture) |
-| Account | A GitHub Copilot subscription (it performs translation and summarization) |
+| Account | A GitHub Copilot subscription, or an API key for any OpenAI-compatible service (it performs translation and summarization) |
 | Hardware | Any x86-64 CPU; no discrete GPU. Recognition uses 4 threads by default |
 | Microphone | Optional. When enabled your own speech is tagged as *you*; headphones recommended |
 
@@ -26,7 +26,7 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no
 
 1. Grab `MeetingTranslate.exe` (about 400 MB, with recognition models and the Copilot runtime bundled) from [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest).
 2. Run it. The first launch unpacks bundled resources (~15 s); a 「译」 tray icon appears when ready.
-3. Log in to Copilot on first use — see [Sign in](#sign-in-to-copilot).
+3. Log in to Copilot on first use — see [Sign in](#sign-in-to-copilot) — or enter your own API key in Settings.
 
 Nothing is written to the registry and no admin rights are needed. Uninstalling means deleting the exe and `%APPDATA%\meeting-translate\`.
 
@@ -53,6 +53,19 @@ An unauthenticated launch shows a guide with two options:
 - **Option 1 (recommended)** — if the `copilot` CLI is installed, click “打开控制台执行 copilot login”, finish the login in the console that opens, then click the re-detect button.
 - **Option 2** — paste a fine-grained Personal Access Token with the **Copilot Requests** permission.
 
+### Using your own model service (bring your own API key)
+
+1. Settings → “Model service” → “Custom (OpenAI-compatible)” → “New…”.
+2. Fill in a name, the base URL (e.g. `https://api.deepseek.com/v1`), the model name (e.g. `deepseek-chat`) and the API key. Leave the prices empty if you don't want a cost estimate.
+3. It takes effect immediately after OK — no restart.
+
+- Anything that speaks `/chat/completions` works: DeepSeek, Kimi, Qwen, OpenAI, Ollama, vLLM, a corporate gateway.
+- The key is encrypted with Windows DPAPI before it is written to `config.json`; on another machine or Windows account you must enter it again.
+- Usage is counted in tokens: the overlay shows input/output tokens for the meeting, and estimates money only if you filled in prices. There is no account-level quota to query.
+- Conversation history is kept locally and resent with every sentence, so token usage grows with meeting length; the rotation interval is configurable.
+- Self-signed internal endpoints can tick “skip certificate verification” on that profile only. Do not enable it for public endpoints.
+- Switching providers mid-meeting summarizes with the old backend first, then opens a session on the new one; on failure the old session keeps running.
+
 ## Usage
 
 ### Running a meeting
@@ -65,7 +78,9 @@ The translation direction (JA→ZH / ZH→JA) lives in settings and is **locked 
 
 ### Overlay and tray
 
-- The overlay is always-on-top and semi-transparent; you can drag it and change font size/opacity. “—” hides it, and the tray item “显示/隐藏字幕窗” brings it back.
+- The overlay is always-on-top and semi-transparent; drag it to move, drag any corner to resize, and double-click near an edge to toggle fullscreen. Font size and opacity live in Settings.
+- “—” hides it and the tray item “显示/隐藏字幕窗” brings it back. Turn off “show overlay” in Settings to start with only the tray icon and hotkey.
+- Enable “Subtitle mode” in Settings to show translations only, without source text or unfinished fragments—useful as subtitles while watching a video.
 - The “🎤 麦克风” button toggles your own microphone. The state is remembered and takes effect immediately.
 - Tray menu: start/pause, end meeting, show/hide overlay, settings, models (quick switch), edit glossary, open recordings folder, summarize past meeting, sign in, quit.
 - The settings window is modeless, so the overlay stays usable. After changing anything, a hint appears next to OK: “设置已修改，点击 OK 后生效”; closing without OK discards the changes. When the overlay is visible, the settings window opens on whichever side has more room.
@@ -111,6 +126,7 @@ Terms feed both the translation prompt and the ASR hotword list. Changes apply f
 - Switching models mid-meeting is immediate: the old model writes a recap, the new session carries that recap plus the last 5 sentences and the glossary, and the switch happens after warm-up.
 - Unsupported reasoning effort is clamped down and reported in the status bar.
 - The overlay shows “account AIC used” and “this meeting AIC” by default. “account quota remaining %” is off by default but always turns red below 10%, without interrupting the meeting.
+- With a custom endpoint, the overlay and the meeting transcript report input/output tokens; money is estimated only when prices are filled in, and the account-quota row is hidden.
 - One session per meeting, rotated every 30 minutes (configurable); every request carries the session history, which is the main controllable source of spend.
 
 ### After the meeting
@@ -126,7 +142,7 @@ You are asked whether to generate minutes, action items and a cleaned bilingual 
 
 | Immediate | From the next start |
 |---|---|
-| translation model, reasoning effort, microphone toggle | audio devices, direction, ASR engine, ASR correction, the three splitting values, session rotation interval |
+| translation model, reasoning effort, microphone toggle, model service & endpoint | audio devices, direction, ASR engine, ASR correction, the three splitting values, session rotation interval |
 
 ## Data location
 
@@ -134,7 +150,7 @@ Everything lives in `%APPDATA%\meeting-translate\` and is never uploaded:
 
 | File | Contents |
 |---|---|
-| `config.json` | settings |
+| `config.json` | settings (API keys for custom endpoints are stored here, encrypted with Windows DPAPI) |
 | `model_stats.json` | measured latency and past meeting usage (for cost estimates) |
 | `glossary.txt` | glossary |
 | `selection_translation_history.md` | selection-translation history (written only when saved) |
@@ -147,7 +163,8 @@ After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<t
 ## Privacy and responsible use
 
 - **Recording requires consent.** Recording laws differ by jurisdiction; obtain consent from participants before capturing meeting audio.
-- The recognized **text** is sent to GitHub Copilot (a GitHub / Microsoft service) for translation, correction and summarization. Audio never leaves your machine. The tool collects no telemetry and reports nothing back to the author.
+- The recognized **text** is sent to the model service you pick in Settings: GitHub Copilot (GitHub / Microsoft) by default, or any OpenAI-compatible endpoint you configure (DeepSeek, Kimi, Qwen, Ollama, a corporate gateway…). Audio never leaves your machine. The tool collects no telemetry and reports nothing back to the author.
+- With a third-party endpoint the meeting text goes to that provider; retention and training policies are theirs to decide. The built-in templates flag common providers — check before using it for confidential meetings.
 - Logs, transcripts and the glossary stay in your local `%APPDATA%` folder.
 - A microphone cannot tell speakers apart: anyone nearby will be tagged as *you*. Turn the microphone off in situations where that matters.
 - The app does not modify system audio settings and installs no drivers.
@@ -155,7 +172,7 @@ After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<t
 ## Known limitations
 
 - Windows only: capture relies on WASAPI loopback; no cross-platform plans.
-- A Copilot subscription is required, and usage is billed in AIC — long meetings keep consuming it.
+- The default Copilot path needs a subscription and is billed in AIC / requests; a custom endpoint is billed in tokens, with the quota set by the provider.
 - The default SenseVoice engine has no hotword support; switch to ReazonSpeech (slower) if you need it.
 - Speaker separation only distinguishes *them* / *you*; multiple people in one room are not separated.
 - The exe is ~400 MB and needs unpacking on launch (~15 s on first run).

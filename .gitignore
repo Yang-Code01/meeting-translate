@@ -24,3 +24,9 @@ spikes/e2e_out.*
 # 本地保留、不公开：设计记录与实验脚本
 docs/
 spikes/
+
+# 本地设计截图、临时脚本与状态（不公开）
+.local/
+
+# 误由未展开的 %SystemDrive% 生成的 Windows 缓存副本
+%SystemDrive%/

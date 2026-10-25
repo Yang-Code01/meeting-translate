@@ -19,3 +19,19 @@ jobs:
 
       - name: Byte-compile all sources
         run: python -m compileall -q main.py meeting_translate scripts
+
+  test:
+    name: Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install pytest httpx
+
+      - name: Run regression tests
+        run: python -m pytest -q
