@@ -16,6 +16,11 @@ _system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"
 if _system32.lower() not in (p.rstrip("\\").lower() for p in os.environ.get("PATH", "").split(os.pathsep)):
     os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _system32
 
+from .qtcom import init_sta  # noqa: E402
+
+# soundcard 导入时会把当前线程的 COM 设成 MTA；Qt 需要 STA，否则原生对话框会卡死。
+init_sta()
+
 import soundcard as sc  # noqa: E402
 
 SAMPLE_RATE = 16000
