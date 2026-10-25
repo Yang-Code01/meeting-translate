@@ -1,6 +1,7 @@
-"""Copilot SDK 翻译：常驻会话、堆积合并、每 N 分钟携带摘要轮换会话、登录检测。
+"""翻译业务层：批次合并、校正解析、会话轮换与摘要、划词会话、用量账本。
 
-所有 SDK 调用都在独立线程的 asyncio 事件循环里执行；对外方法线程安全。
+Copilot 的具体调用在 backend.py；本模块不 import copilot，也不知道会话历史
+是服务端保存还是本地维护。
 """
 
 from __future__ import annotations
@@ -14,20 +15,19 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-
-from copilot import CopilotClient
-from copilot.generated.rpc import AccountGetQuotaRequest, AccountLoginRequest
-from copilot.generated.session_events import SessionUsageCheckpointData
-from copilot.session import PermissionHandler
+from typing import TYPE_CHECKING
 
 from . import glossary, lang, stats
-from .asr import Final
+from .backend import REQUEST_TIMEOUT, AuthState, Backend, CopilotBackend, ModelOption, Quota, Session
 from .transcript import Transcript
+from .usage import Usage
+
+if TYPE_CHECKING:  # 仅用于类型标注：运行时导入会让本模块依赖 ASR 栈
+    from .asr import Final
 
 log = logging.getLogger(__name__)
 
-GITHUB_HOST = "https://github.com"
-REQUEST_TIMEOUT = 60.0
+
 PRIME_PROMPT = "（连接测试，无需翻译，请只回复：好）"
 SELECTION_SYSTEM_PROMPT = """\
 你是日语翻译助手。对用户提供的日文，生成中文翻译和带假名注音的原文。
@@ -74,7 +74,6 @@ SEGMENT_SUMMARY_PROMPT = """\
 下面是一场{src}会议的一个片段（附{dst}译文）。请用中文写出截至目前的会议前情摘要（300 字以内），
 包含：正在讨论的议题、已达成的结论、出现的人名/系统名/专有术语（保留原词）。只输出摘要正文。"""
 
-
 def system_prompt(direction: str, correct: bool = False) -> str:
     d = lang.get(direction)
     return (SYSTEM_PROMPT_CORRECT if correct else SYSTEM_PROMPT).format(src=d.src, dst=d.dst)
@@ -83,14 +82,6 @@ def system_prompt(direction: str, correct: bool = False) -> str:
 def segment_summary_prompt(direction: str) -> str:
     d = lang.get(direction)
     return SEGMENT_SUMMARY_PROMPT.format(src=d.src, dst=d.dst)
-
-
-@dataclass
-class AuthState:
-    ok: bool
-    login: str | None = None
-    message: str = ""
-
 
 @dataclass
 class Translation:
@@ -105,86 +96,6 @@ class SelectionTranslation:
     chinese: str
     hiragana: str
 
-
-@dataclass
-class ModelOption:
-    id: str
-    name: str
-    input_price: float | None  # AIC / 百万 token
-    output_price: float | None
-    supports_effort: bool
-    efforts: list[str]
-    enabled: bool
-
-    @property
-    def price(self) -> float | None:
-        if self.input_price is None or self.output_price is None:
-            return None
-        return stats.blended_price(self.input_price, self.output_price)
-
-    @classmethod
-    def from_info(cls, m) -> "ModelOption":
-        d = m.to_dict() if hasattr(m, "to_dict") else {}
-        tp = (d.get("billing") or {}).get("tokenPrices") or {}
-        supports = bool(((d.get("capabilities") or {}).get("supports") or {}).get("reasoningEffort"))
-        state = (d.get("policy") or {}).get("state")
-        return cls(
-            id=d.get("id") or m.id,
-            name=d.get("name") or d.get("id") or m.id,
-            input_price=tp.get("inputPrice"),
-            output_price=tp.get("outputPrice"),
-            supports_effort=supports,
-            efforts=list(d.get("supportedReasoningEfforts") or []),
-            enabled=state in (None, "enabled"),
-        )
-
-
-@dataclass
-class Quota:
-    remaining_percent: float | None
-    unlimited: bool
-    used: int | None = None  # 本计费周期账户已用
-    entitlement: int | None = None  # 本周期额度；-1 / None = 不限或未知
-
-
-class Usage:
-    """本场用量账本：按会话累计 nanoAiu（会话内为累计值，取最大）。"""
-
-    def __init__(self, on_change: Callable[[float], None] | None = None) -> None:
-        self._by_session: dict[str, int] = {}
-        self._lock = threading.Lock()
-        self._on_change = on_change
-
-    def update(self, session_id: str, nano: int) -> None:
-        with self._lock:
-            if nano <= self._by_session.get(session_id, 0):
-                return
-            self._by_session[session_id] = nano
-            total = self.aic_unlocked()
-        if self._on_change:
-            self._on_change(total)
-
-    def aic_unlocked(self) -> float:
-        return sum(self._by_session.values()) / 1e9
-
-    @property
-    def aic(self) -> float:
-        with self._lock:
-            return self.aic_unlocked()
-
-
-def clamp_effort(opt: ModelOption | None, effort: str | None) -> tuple[str | None, str]:
-    """返回 (实际 effort, 回退说明)。effort=None 表示用模型默认值。"""
-    if not effort or effort == "default" or opt is None:
-        return (effort if effort != "default" else None), ""
-    if not opt.supports_effort:
-        return None, f"{opt.name} 不支持推理强度设置，已用默认值"
-    if not opt.efforts or effort in opt.efforts:
-        return effort, ""
-    fallback = opt.efforts[0]
-    return fallback, f"{opt.name} 不支持 effort={effort}，已改用 {fallback}"
-
-
 def _format_batch(items: list[Final], correct: bool = False) -> str:
     if correct:
         lines = [f"{i}. 【{f.source}】{f.ja}" for i, f in enumerate(items, 1)]
@@ -196,7 +107,7 @@ def _format_batch(items: list[Final], correct: bool = False) -> str:
 
 
 _NUM_LINE = re.compile(r"^\s*(\d+)\s*[.．、:：)）]\s*(.*)$")
-_PAIR_LINE = re.compile(r"^\s*(\d+)\s*[.．、)）]?\s*(原|译|譯)\s*[:：]\s*(.*)$")
+_PAIR_LINE = re.compile(r"^\s*(\d+)\s*[.．、)）]?\s*(原|译|譯|訳)\s*[:：]\s*(.*)$")
 _SPEAKER_TAG = re.compile(r"^【[^】]{1,4}】")
 
 
@@ -225,9 +136,6 @@ def _parse_batch(reply: str, n: int) -> list[str]:
         out[-1] = reply.strip()
     return out
 
-
-def _reply_text(event) -> str:
-    return (getattr(getattr(event, "data", None), "content", None) or "").strip() if event else ""
 
 
 def _parse_selection_translation(reply: str) -> SelectionTranslation:
@@ -263,35 +171,35 @@ def _reading_keeps_source(source: str, reading: str) -> bool:
     kept = len(_KANA_RE.findall(re.sub(r"（[^）]*）|\([^)]*\)", "", reading)))
     return kept >= src_kana * 0.6
 
-
 class Translator:
+    """翻译业务层：队列合并、批次解析、轮换与摘要、划词会话、用量账本。"""
+
     def __init__(
         self,
         on_translation: Callable[[Translation], None],
         on_status: Callable[[str], None],
         on_auth: Callable[[AuthState], None],
         on_usage: Callable[[float], None] | None = None,
+        backend: Backend | None = None,
     ) -> None:
         self._on_translation = on_translation
         self._on_status = on_status
         self._on_auth = on_auth
         self._on_usage = on_usage
-        self._options: dict[str, ModelOption] = {}
-        self._session_usage: dict[str, Usage] = {}
+        self._backend: Backend = backend or CopilotBackend(on_status=on_status)
         self.usage = Usage(on_usage)
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="translator", daemon=True)
-        self._client: CopilotClient | None = None
-        self._session = None
+        self._session: Session | None = None
         self._session_started = 0.0
         self._segment_start_wall = 0.0
         self._summary = ""
         self._send_lock: asyncio.Lock | None = None
         self._selection_lock: asyncio.Lock | None = None
-        self._selection_session = None
+        self._selection_session: Session | None = None
         self._selection_key: tuple[str, str] | None = None
         self._selection_count = 0
-        self._queue: asyncio.Queue[Final] | None = None
+        self._queue: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None
         self._rotating = False
         self._transcript: Transcript | None = None
@@ -315,7 +223,7 @@ class Translator:
         try:
             self._call(self._shutdown()).result(timeout=15)
         except Exception:
-            log.exception("关闭 Copilot 客户端失败")
+            log.exception("关闭翻译后端失败")
         self._loop.call_soon_threadsafe(self._loop.stop)
 
     def submit(self, final: Final) -> None:
@@ -343,9 +251,28 @@ class Translator:
     def recheck_auth(self) -> concurrent.futures.Future:
         return self._call(self._restart_client())
 
+    def use_backend(self, backend: Backend) -> concurrent.futures.Future:
+        """换后端（设置里切换服务商/端点后调用）：关旧会话、启新后端并重新预热。"""
+        return self._call(self._switch_backend(backend))
+
+    async def _switch_backend(self, backend: Backend) -> AuthState:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        if self._selection_session is not None:
+            await self._selection_session.close()
+            self._selection_session = None
+        await self._backend.stop()
+        self._backend = backend
+        return await self._restart_client()
+
     def list_models(self) -> concurrent.futures.Future:
-        """Future[list[ModelOption]]，实时从 Copilot 拉取。"""
+        """Future[list[ModelOption]]，实时从后端拉取。"""
         return self._call(self._list_models())
+
+    def list_models_for(self, profile: dict) -> concurrent.futures.Future:
+        """Future[list[ModelOption]]：拉取某条自定义端点自己的模型列表。"""
+        return self._call(self._list_models_for(profile))
 
     def switch_model(self, model: str, effort: str) -> concurrent.futures.Future:
         return self._call(self._switch_model(model, effort))
@@ -371,13 +298,13 @@ class Translator:
         return self._model
 
     def option(self, model: str) -> ModelOption | None:
-        return self._options.get(model)
+        return self._backend.option(model)
 
     def run(self, coro_factory: Callable[["Translator"], object]) -> concurrent.futures.Future:
-        """在翻译线程执行任意协程（供会后整理复用同一客户端）。"""
+        """在翻译线程执行任意协程（供会后整理复用同一后端）。"""
         return self._call(coro_factory(self))  # type: ignore[arg-type]
 
-    # ---- 客户端与登录 ----
+    # ---- 启动与登录 ----
 
     async def _start(self) -> None:
         self._send_lock = asyncio.Lock()
@@ -387,70 +314,73 @@ class Translator:
         await self._restart_client()
 
     async def _restart_client(self) -> AuthState:
-        if self._client is not None:
-            try:
-                await self._client.stop()
-            except Exception:
-                log.exception("停止客户端失败")
         self._selection_session, self._selection_key = None, None
-        self._on_status("正在连接 Copilot…")
-        self._client = CopilotClient(log_level="error")
-        await self._client.start()
-        state = await self._check_auth()
+        state = await self._backend.start()
         self._on_auth(state)
         if state.ok:
             asyncio.create_task(self._warmup())
         return state
 
-    async def _check_auth(self) -> AuthState:
-        assert self._client is not None
-        try:
-            st = await self._client.get_auth_status()
-            if st.isAuthenticated:
-                return AuthState(True, getattr(st, "login", None))
-            return AuthState(False, message=getattr(st, "statusMessage", "") or "未登录")
-        except Exception as e:
-            return AuthState(False, message=str(e))
-
     async def _login_with_token(self, token: str) -> AuthState:
-        assert self._client is not None
-        try:
-            await self._client.rpc.account.login(AccountLoginRequest(host=GITHUB_HOST, token=token.strip()))
-        except Exception as e:
-            state = AuthState(False, message=f"Token 无效或缺少 Copilot Requests 权限：{e}")
-            self._on_auth(state)
-            return state
-        return await self._restart_client()
+        state = await self._backend.login(token)
+        self._on_auth(state)
+        if state.ok:
+            asyncio.create_task(self._warmup())
+        return state
 
     async def _list_models(self) -> list[ModelOption]:
-        assert self._client is not None
-        opts = [ModelOption.from_info(m) for m in await self._client.list_models()]
-        self._options = {o.id: o for o in opts}
+        return await self._backend.models()
+
+    async def _list_models_for(self, profile: dict) -> list[ModelOption]:
+        """为设置窗口里正在编辑的端点临时拉一次模型列表。
+
+        不能问正在运行的后端：那条端点还没保存，运行中的后端指向的是上一条，
+        问它永远问不到新填的地址。
+        """
+        from . import secrets
+        from .openai_backend import OpenAICompatBackend, OpenAIProfile
+
+        base_url = (profile.get("base_url") or "").strip()
+        if not base_url:
+            raise RuntimeError("先填写接口地址")
+        if not (profile.get("api_key") or profile.get("model")):
+            raise RuntimeError("先填写 API key")
+        backend = OpenAICompatBackend(
+            OpenAIProfile(
+                name=profile.get("name", ""),
+                base_url=base_url,
+                api_key=secrets.unprotect(profile.get("api_key", "")),
+                model=(profile.get("model") or "").strip(),
+                input_price=profile.get("input_price"),
+                output_price=profile.get("output_price"),
+                verify_tls=bool(profile.get("verify_tls", True)),
+            ),
+            on_status=self._on_status,
+        )
+        try:
+            opts = await backend.models()
+        finally:
+            await backend.stop()
+        if not opts:
+            detail = backend.models_error
+            hint = f"（{detail}）" if detail else ""
+            raise RuntimeError(f"该端点没有返回模型列表{hint}，请检查接口地址或手动填写模型名")
         return opts
 
     async def _quota(self) -> Quota | None:
-        assert self._client is not None
-        try:
-            r = await self._client.rpc.account.get_quota(AccountGetQuotaRequest())
-        except Exception:
-            log.exception("查询配额失败")
-            return None
-        snap = (r.quota_snapshots or {}).get("premium_interactions")
-        if snap is None:
-            return None
-        return Quota(
-            snap.remaining_percentage,
-            bool(snap.is_unlimited_entitlement),
-            getattr(snap, "used_requests", None),
-            getattr(snap, "entitlement_requests", None),
-        )
+        return await self._backend.quota()
 
-    async def _prime(self, session) -> None:
-        """新会话的首个请求有数秒冷启动，先用一条短请求吸收掉。"""
+    async def _prime(self, session: Session) -> None:
+        """新会话的第一个请求有数秒冷启动，先用一条短请求吸收掉。
+
+        失败不再静默：吞掉异常只会让人在界面上看到「用不起来」，看不到原因。
+        """
         try:
-            await session.send_and_wait(PRIME_PROMPT, timeout=REQUEST_TIMEOUT)
-        except Exception:
+            await session.send(PRIME_PROMPT, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
             log.warning("会话预热失败", exc_info=True)
+            self._on_status(f"翻译服务返回错误：{e}")
+            raise  # 让开场就失败：否则界面只显示「会话已建立」，用户不知道根本翻不了
 
     async def _warmup(self) -> None:
         """启动时用临时会话预热运行时（不计入会议用量）。"""
@@ -459,75 +389,28 @@ class Translator:
                 await self._list_models()
             except Exception:
                 log.exception("获取模型列表失败")
-            s = await self.new_session("只回复：OK", self._model or "claude-haiku-5.5", "none")
-            await s.send_and_wait("ping", timeout=REQUEST_TIMEOUT)
-            await self._drop_session(s)
-            self._on_status("Copilot 已就绪")
+            s = await self.new_session("只回复：OK", self._model or self._backend.default_model(), "none")
+            await s.send("ping", timeout=REQUEST_TIMEOUT)
+            await s.close()
+            self._on_status("模型服务已就绪")
         except Exception as e:
             log.exception("预热失败")
-            self._on_status(f"Copilot 预热失败：{e}")
+            self._on_status(f"模型服务预热失败：{e}")
 
     async def _shutdown(self) -> None:
         if self._worker:
             self._worker.cancel()
         if self._session is not None:
-            await self._drop_session(self._session)
+            await self._session.close()
         if self._selection_session is not None:
-            await self._drop_session(self._selection_session)
+            await self._selection_session.close()
             self._selection_session = None
-        if self._client is not None:
-            await self._client.stop()
+        await self._backend.stop()
 
     # ---- 会话 ----
 
-    async def new_session(self, system: str, model: str, effort: str | None, usage: Usage | None = None):
-        assert self._client is not None
-        if not self._options:
-            try:
-                await self._list_models()
-            except Exception:
-                log.exception("获取模型列表失败")
-        effort, note = clamp_effort(self._options.get(model), effort)
-        if note:
-            self._on_status(note)
-        s = await self._client.create_session(
-            on_permission_request=PermissionHandler.approve_all,
-            model=model,
-            reasoning_effort=effort,
-            system_message={"mode": "replace", "content": system},
-            available_tools=[],
-            skip_custom_instructions=True,
-            enable_skills=False,
-            streaming=False,
-        )
-        if usage is not None:
-            sid = s.session_id
-
-            def on_event(e) -> None:
-                d = getattr(e, "data", None)
-                if isinstance(d, SessionUsageCheckpointData) and d.total_nano_aiu:
-                    usage.update(sid, int(d.total_nano_aiu))
-
-            s.on(on_event)
-            self._session_usage[sid] = usage
-        return s
-
-    async def _drop_session(self, session) -> None:
-        sid = getattr(session, "session_id", None)
-        usage = self._session_usage.pop(sid, None) if sid else None
-        if usage is not None and sid:
-            try:
-                m = (await session.rpc.usage.get_metrics()).to_dict()
-                nano = sum(int(v.get("totalNanoAiu") or 0) for v in (m.get("modelMetrics") or {}).values())
-                usage.update(sid, nano)
-            except Exception:
-                log.debug("获取会话用量失败 %s", sid, exc_info=True)
-        try:
-            await session.disconnect()
-            if sid and self._client is not None:
-                await self._client.delete_session(sid)
-        except Exception:
-            log.debug("删除会话失败 %s", sid, exc_info=True)
+    async def new_session(self, system: str, model: str, effort: str | None, usage: Usage | None = None) -> Session:
+        return await self._backend.create_session(system, model, effort, usage)
 
     def _direction(self) -> str:
         return self._transcript.direction if self._transcript is not None else lang.JA_ZH
@@ -556,14 +439,18 @@ class Translator:
         self.usage = Usage(self._on_usage)
         assert self._send_lock is not None
         new = await self.new_session(self._system_with_context(), model, effort, self.usage)
-        await self._prime(new)
+        try:
+            await self._prime(new)
+        except Exception:
+            await new.close()
+            raise
         async with self._send_lock:
             old = self._session
             self._session = new
             self._session_started = time.monotonic()
             self._segment_start_wall = time.time()
         if old is not None:
-            await self._drop_session(old)
+            await old.close()
         self._on_status(f"会话已建立（{model}）")
 
     async def _end_meeting(self) -> None:
@@ -579,7 +466,7 @@ class Translator:
                 break
             await asyncio.sleep(0.5)
         if self._session is not None:
-            await self._drop_session(self._session)
+            await self._session.close()
             self._session = None
         self._transcript = None
 
@@ -599,10 +486,10 @@ class Translator:
             await self._prime(s)
             for text in BENCH_SENTENCES.get(direction, BENCH_SENTENCES[lang.JA_ZH]):
                 t0 = time.monotonic()
-                await s.send_and_wait(text, timeout=REQUEST_TIMEOUT)
+                await s.send(text, timeout=REQUEST_TIMEOUT)
                 times.append(time.monotonic() - t0)
         finally:
-            await self._drop_session(s)
+            await s.close()
         st = stats.get()
         for t in times:
             st.record_latency(model, t)
@@ -610,18 +497,18 @@ class Translator:
 
     async def _translate_selected(self, text: str, model: str, effort: str) -> SelectionTranslation:
         if self._selection_lock is None:
-            raise RuntimeError("Copilot 翻译客户端尚未启动")
+            raise RuntimeError("翻译客户端尚未启动")
         async with self._selection_lock:
             result = None
             for _ in range(2):
                 session = await self._selection_session_for(model, effort)
                 try:
-                    reply = await session.send_and_wait(_selection_request(text), timeout=REQUEST_TIMEOUT)
+                    reply = await session.send(_selection_request(text), timeout=REQUEST_TIMEOUT)
                 except Exception:
                     await self._reset_selection_session()
                     raise
                 self._selection_count += 1
-                result = _parse_selection_translation(_reply_text(reply))
+                result = _parse_selection_translation(reply)
                 if _reading_keeps_source(text, result.hiragana):
                     return result
                 log.warning("划词读音未保留日文原文，换新会话重试")
@@ -630,7 +517,7 @@ class Translator:
             return SelectionTranslation(result.chinese, text.strip())
 
     async def _prepare_selection(self, model: str, effort: str) -> None:
-        if self._selection_lock is None or self._client is None:
+        if self._selection_lock is None:
             return
         try:
             async with self._selection_lock:
@@ -638,7 +525,7 @@ class Translator:
         except Exception:
             log.warning("预热划词翻译会话失败", exc_info=True)
 
-    async def _selection_session_for(self, model: str, effort: str):
+    async def _selection_session_for(self, model: str, effort: str) -> Session:
         """复用划词会话；模型/推理强度变化或请求次数达到上限时换新会话，避免上下文无限增长。"""
         key = (model, effort)
         if (
@@ -649,14 +536,18 @@ class Translator:
             return self._selection_session
         await self._reset_selection_session()
         session = await self.new_session(SELECTION_SYSTEM_PROMPT, model, effort)
-        await self._prime(session)
+        try:
+            await self._prime(session)
+        except Exception:
+            await session.close()
+            raise
         self._selection_session, self._selection_key, self._selection_count = session, key, 0
         return session
 
     async def _reset_selection_session(self) -> None:
         old, self._selection_session, self._selection_key = self._selection_session, None, None
         if old is not None:
-            await self._drop_session(old)
+            await old.close()
 
     async def _rotate(self, model: str | None = None, effort: str | None = None) -> None:
         """后台生成摘要并新建会话（可换模型）；期间旧会话继续翻译。"""
@@ -671,11 +562,15 @@ class Translator:
                 text = "\n".join(f"【{e.source}】{e.ja}\n→ {e.zh or ''}" for e in segment)
                 prompt = (f"已有前情摘要：\n{self._summary}\n\n" if self._summary else "") + "新片段：\n" + text
                 s = await self.new_session(segment_summary_prompt(transcript.direction), self._model, "low", self.usage)
-                reply = await s.send_and_wait(prompt, timeout=180)
-                await self._drop_session(s)
-                self._summary = _reply_text(reply) or self._summary
+                reply = await s.send(prompt, timeout=180)
+                await s.close()
+                self._summary = reply or self._summary
             new = await self.new_session(self._system_with_context(), target, target_effort, self.usage)
-            await self._prime(new)
+            try:
+                await self._prime(new)
+            except Exception:
+                await new.close()
+                raise
             assert self._send_lock is not None
             async with self._send_lock:
                 old, self._session = self._session, new
@@ -683,7 +578,7 @@ class Translator:
                 self._session_started = time.monotonic()
                 self._segment_start_wall = time.time()
             if old is not None:
-                await self._drop_session(old)
+                await old.close()
             self._on_status(f"已切换到 {target}" if model else "已轮换翻译会话（携带前情摘要）")
         except Exception as e:
             log.exception("轮换会话失败")
@@ -716,15 +611,12 @@ class Translator:
                 async with self._send_lock:
                     model = self._model
                     correct = self._correct
-                    reply = await self._session.send_and_wait(
-                        _format_batch(batch, correct), timeout=REQUEST_TIMEOUT
-                    )
-                text = _reply_text(reply)
-                parsed = _parse_corrected(text, len(batch)) if correct else None
+                    reply = await self._session.send(_format_batch(batch, correct), timeout=REQUEST_TIMEOUT)
+                parsed = _parse_corrected(reply, len(batch)) if correct else None
                 if parsed is not None:
                     sources, texts = parsed
                 else:
-                    texts = _parse_batch(text, len(batch))
+                    texts = _parse_batch(reply, len(batch))
                 ok = True
             except Exception as e:
                 log.exception("翻译失败")
@@ -735,3 +627,4 @@ class Translator:
             if ok and len(batch) == 1:
                 stats.get().record_latency(model, latency)
             self._on_translation(Translation([f.id for f in batch], texts, latency, sources))
+

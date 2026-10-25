@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import glossary, lang
 from .transcript import Transcript, fmt_aic
-from .translator import Translator, Usage, _reply_text
+from .translator import Translator, Usage
 
 CHUNK_ENTRIES = 120
 TIMEOUT = 600.0
@@ -108,22 +108,23 @@ def summarize(
         try:
             for i, c in enumerate(chunks, 1):
                 on_progress(f"整理中：清洗全文 {i}/{len(chunks)}", i - 1, total)
-                cleaned.append(_reply_text(await s.send_and_wait(c, timeout=TIMEOUT)))
+                cleaned.append(await s.send(c, timeout=TIMEOUT))
         finally:
-            await tr._drop_session(s)
+            await s.close()
 
         on_progress("整理中：生成纪要、待办与标题", len(chunks), total)
         full = "\n\n".join(cleaned)
         s = await tr.new_session(MINUTES_PROMPT.format(src=d.src, dst=d.dst, d=d) + "\n\n" + terms, model, "medium", usage)
         try:
-            title, minutes = split_title(_reply_text(await s.send_and_wait(full, timeout=TIMEOUT)))
+            title, minutes = split_title(await s.send(full, timeout=TIMEOUT))
         finally:
-            await tr._drop_session(s)
+            await s.close()
 
         summarize_aic = usage.aic - u0
         total_aic = translate_aic + summarize_aic
         on_progress("整理中：写出整理文件", len(chunks) + 1, total)
-        transcript.set_usage(total_aic, model)
+        tokens = usage.tokens if total_aic <= 0 and usage.tokens != (0, 0) else None
+        transcript.set_usage(total_aic, model, tokens)
         transcript.save()
         now = datetime.now()
         title = safe_title(title, d.fallback_title)
