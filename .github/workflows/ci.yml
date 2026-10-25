@@ -31,7 +31,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: python -m pip install pytest httpx numpy "pyside6-essentials>=6.12.0" soundcard
+        run: python -m pip install pytest httpx numpy "pyside6-essentials>=6.12.0" "sherpa-onnx==1.13.8" soundcard
 
       - name: Run regression tests
         run: python -m pytest -q
