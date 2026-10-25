@@ -18,6 +18,7 @@ from .config import TRANSCRIPT_DIR
 
 _MD_TITLE = re.compile(r"^# 会议记录 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
 _MD_USAGE = re.compile(r"^> 本场用量：([\d.]+) AIC（模型 (.*)）")
+_MD_USAGE_TOKENS = re.compile(r"^> 本场用量：([\d,]+) 输入 / ([\d,]+) 输出 token（模型 (.*)）")
 _MD_DIRECTION = re.compile(r"^> 翻译方向：(\S+)")
 _MD_ENTRY = re.compile(r"^- `(\d{2}:\d{2}:\d{2})` 【(.+?)】(.*?)\s*$")
 _MD_ZH = re.compile(r"^  → (.*)$")
@@ -45,6 +46,7 @@ class Transcript:
         self._by_id: dict[int, Entry] = {}
         self._lock = threading.Lock()
         self.usage_aic = 0.0
+        self.usage_tokens: tuple[int, int] | None = None  # 自定义端点：输入/输出 token
         self.models: list[str] = []
 
     @classmethod
@@ -54,6 +56,7 @@ class Transcript:
         for e in data["entries"]:
             t._add(Entry(**e))
         t.usage_aic = data.get("usage_aic", 0.0)
+        t.usage_tokens = tuple(data["usage_tokens"]) if data.get("usage_tokens") else None
         t.models = data.get("models", [])
         return t
 
@@ -75,6 +78,9 @@ class Transcript:
         for line in lines[1:]:
             if m := _MD_DIRECTION.match(line):
                 t.direction = lang.from_label(m.group(1))
+            elif m := _MD_USAGE_TOKENS.match(line):
+                t.usage_tokens = (int(m.group(1).replace(",", "")), int(m.group(2).replace(",", "")))
+                t.models = [x.strip() for x in m.group(3).split(",") if x.strip() and x.strip() != "—"]
             elif m := _MD_USAGE.match(line):
                 t.usage_aic = float(m.group(1))
                 t.models = [x.strip() for x in m.group(2).split(",") if x.strip() and x.strip() != "—"]
@@ -106,9 +112,11 @@ class Transcript:
                 self._by_id[entry_id].ja = ja
         self.save()
 
-    def set_usage(self, aic: float, model: str | None = None) -> None:
+    def set_usage(self, aic: float, model: str | None = None, tokens: tuple[int, int] | None = None) -> None:
         with self._lock:
             self.usage_aic = aic
+            if tokens is not None:
+                self.usage_tokens = tokens
             if model and model not in self.models:
                 self.models.append(model)
 
@@ -135,7 +143,13 @@ class Transcript:
         lines = [f"# 会议记录 {self.started:%Y-%m-%d %H:%M}", ""]
         if self.direction != lang.JA_ZH:
             lines += [f"> 翻译方向：{lang.get(self.direction).label}", ""]
-        if self.usage_aic:
+        if self.usage_tokens:
+            tin, tout = self.usage_tokens
+            lines += [
+                f"> 本场用量：{tin:,} 输入 / {tout:,} 输出 token（模型 {', '.join(self.models) or '—'}）",
+                "",
+            ]
+        elif self.usage_aic:
             lines += [f"> 本场用量：{fmt_aic(self.usage_aic)} AIC（模型 {', '.join(self.models) or '—'}）", ""]
         for e in self.entries:
             ts = datetime.fromtimestamp(e.wall_time).strftime("%H:%M:%S")
@@ -149,6 +163,7 @@ class Transcript:
                 "started": self.started.isoformat(),
                 "direction": self.direction,
                 "usage_aic": self.usage_aic,
+                "usage_tokens": self.usage_tokens,
                 "models": self.models,
                 "entries": [asdict(e) for e in self.entries],
             }

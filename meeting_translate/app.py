@@ -15,7 +15,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon
 from PySide6.QtCore import Qt, QTimer
 
-from . import glossary, lang, stats
+from . import glossary, lang, qtcom, stats
 from .asr import AsrEngine, AsrWorker, Final, ModelMissing, create_engine
 from .audio import ME, THEM, Capture
 from .config import (
@@ -30,11 +30,11 @@ from .config import (
 from .hotkey import GlobalHotkey
 from .joiner import Joiner, Pending
 from .selection import SelectionCapture, SelectionRecord, append_history
+from .providers import make_backend
 from .summarize import summarize
 from .transcript import Entry, Transcript, fmt_aic
 from .translator import AuthState, ModelOption, Quota, Translator
 from .ui import (
-    FRAME_ALLOWANCE,
     MODEL_LABELS,
     Bridge,
     LoginDialog,
@@ -117,7 +117,8 @@ class App:
         self.overlay.mic_toggled.connect(self.set_mic_enabled)
         self.overlay.retry_clicked.connect(self._retry_summary)
         self.overlay.geometry_changed.connect(self._save_geometry)
-        self.overlay.show()
+        if self.settings.show_overlay:
+            self._show_overlay()
         self.selection_popup = SelectionResultPopup()
         self.selection_popup.apply_style(self.settings)
         self.selection_popup.user_resized.connect(self._save_selection_popup_size)
@@ -136,6 +137,7 @@ class App:
             on_status=self.bridge.status.emit,
             on_auth=self.bridge.auth.emit,
             on_usage=self.bridge.usage.emit,
+            backend=make_backend(self.settings, self.bridge.status.emit),
         )
         self._watch(self.translator.start(), "start")
 
@@ -159,6 +161,12 @@ class App:
                 self.bridge.job_done.emit(tag, e)
 
         fut.add_done_callback(done)
+
+    def _active_model(self) -> str:
+        """当前后端真正要用的模型名：自定义端点由端点配置决定。"""
+        if self.settings.provider == "openai":
+            return (self.settings.profile() or {}).get("model", "")
+        return self.settings.model
 
     def _set_status(self, text: str) -> None:
         self.overlay.status.setText(text)
@@ -200,11 +208,20 @@ class App:
         for o in ordered:
             act = m.addAction(model_label(o, self.models, best), lambda mid=o.id: self.set_model(mid))
             act.setCheckable(True)
-            act.setChecked(o.id == self.settings.model)
+            act.setChecked(o.id == self._active_model())
             act.setEnabled(o.enabled)
 
     def set_model(self, model: str, effort: str | None = None) -> None:
         effort = effort or self.settings.reasoning_effort
+        if self.settings.provider == "openai":
+            # 自定义端点的模型名存在端点配置里；换模型等于换一条要连的端点。
+            profile = self.settings.profile()
+            if profile is None or profile.get("model") == model:
+                return
+            profile["model"] = model
+            self.settings.save()
+            self._rebind_backend()
+            return
         changed = (model, effort) != (self.translator.model, self.translator._effort)
         self.settings.model, self.settings.reasoning_effort = model, effort
         self.settings.save()
@@ -234,11 +251,32 @@ class App:
     def _on_usage(self, aic: float) -> None:
         self.usage_aic = aic
         if self.transcript is not None:
-            self.transcript.set_usage(aic, self.translator.model)
+            tokens = self.translator.usage.tokens if self.settings.provider == "openai" else None
+            self.transcript.set_usage(aic, self.translator.model, tokens)
         self._show_usage()
+
+    def _token_cost(self, tin: int, tout: int) -> float | None:
+        profile = self.settings.profile()
+        if not profile:
+            return None
+        price_in = profile.get("input_price") or 0
+        price_out = profile.get("output_price") or 0
+        if not price_in and not price_out:
+            return None
+        return (tin / 1e6) * price_in + (tout / 1e6) * price_out
 
     def _show_usage(self) -> None:
         s = self.settings
+        if s.provider == "openai":  # 自定义端点没有 AIC，只有 token
+            tin, tout = self.translator.usage.tokens
+            parts = []
+            if s.show_meeting_aic and (self.state != IDLE or tin or tout):
+                parts.append(f"本场 {tin:,} 输入 / {tout:,} 输出 token")
+                cost = self._token_cost(tin, tout)
+                if cost:
+                    parts.append(f"≈ ¥{cost:.2f}")
+            self.overlay.set_usage(" · ".join(parts), False)
+            return
         parts = []
         if s.show_meeting_aic and (self.state != IDLE or self.usage_aic):
             parts.append(f"本场 {fmt_aic(self.usage_aic)} AIC")
@@ -257,8 +295,18 @@ class App:
                     parts.append(f"账户剩余 {q.remaining_percent:.1f}%")
         self.overlay.set_usage(" · ".join(parts), warn)
 
+    def _show_overlay(self) -> None:
+        self.overlay.ensure_on_screen()
+        self.overlay.show()
+
     def _toggle_overlay(self) -> None:
-        self.overlay.setVisible(not self.overlay.isVisible())
+        """托盘/双击托盘图标的临时开关；同步进设置，重启后保持。"""
+        self.settings.show_overlay = not self.overlay.isVisible()
+        self.settings.save()
+        if self.settings.show_overlay:
+            self._show_overlay()
+        else:
+            self.overlay.hide()
 
     def _register_hotkey(self) -> None:
         if self.hotkey:
@@ -299,7 +347,7 @@ class App:
         request_id = self._selection_request_id
         self._latest_selection_request = request_id
         self.selection_popup.show_loading(anchor)
-        future = self.translator.translate_selected(text, self.settings.model, self.settings.reasoning_effort)
+        future = self.translator.translate_selected(text, self._active_model(), self.settings.reasoning_effort)
         self._watch(
             future,
             (
@@ -417,7 +465,8 @@ class App:
         s = self.settings
         self.transcript = Transcript(direction=s.direction)
         self.overlay.clear()
-        self.overlay.show()
+        if s.show_overlay:
+            self._show_overlay()
         self.joiner = Joiner(
             s.hold_seconds,
             s.hold_max_seconds,
@@ -429,14 +478,14 @@ class App:
             lang="zh" if s.direction == lang.ZH_JA else "ja",
         )
         self.usage_aic = 0.0
-        opt = self.translator.option(s.model)
+        opt = self.translator.option(self._active_model())
         self._meeting_price = opt.price if opt else None
         self._refresh_quota()
         self._quota_timer.start()
         self._busy = True
         self._watch(
             self.translator.start_meeting(
-                self.transcript, s.model, s.reasoning_effort, s.session_rotate_minutes, s.context_sentences, terms,
+                self.transcript, self._active_model(), s.reasoning_effort, s.session_rotate_minutes, s.context_sentences, terms,
                 s.asr_correct,
             ),
             "meeting_started",
@@ -547,10 +596,11 @@ class App:
     def _run_summary(self, t: Transcript) -> None:
         self._busy = True
         self._summary_target = t
-        self.overlay.show()
+        if self.settings.show_overlay:
+            self._show_overlay()
         self.overlay.show_progress("整理中：准备…", 0, 0)
         usage = self.translator.usage if t is self.transcript else None
-        self._watch(self.translator.run(summarize(t, self.settings.model, self.bridge.progress.emit, usage)), "summary")
+        self._watch(self.translator.run(summarize(t, self._active_model(), self.bridge.progress.emit, usage)), "summary")
 
     def _retry_summary(self) -> None:
         if self._summary_target is None:
@@ -565,11 +615,14 @@ class App:
         self.overlay.show_progress(text, value, maximum)
 
     def summarize_history(self) -> None:
+        # 悬浮窗是置顶的，拿它当父窗口能让文件对话框盖在上面；但它可能被用户在设置里
+        # 关掉了，隐藏的父窗口会让原生对话框一起藏起来，界面看着就像卡死了。
+        owner = self._settings_dlg or (self.overlay if self.overlay.isVisible() else None)
         if self._busy or self.state != IDLE:
-            QMessageBox.information(self.overlay, "会后整理", "请先结束当前会议。")
+            QMessageBox.information(owner, "会后整理", "请先结束当前会议。")
             return
         start = self._save_dir() or TRANSCRIPT_DIR
-        path, _ = QFileDialog.getOpenFileName(self.overlay, "选择会议记录", str(start), "会议记录 (*.md)")
+        path, _ = QFileDialog.getOpenFileName(owner, "选择会议记录", str(start), "会议记录 (*.md)")
         if not path:
             return
         p = Path(path)
@@ -578,7 +631,7 @@ class App:
             if not t.entries:
                 raise ValueError("没有解析到任何发言")
         except (OSError, ValueError) as e:
-            QMessageBox.warning(self.overlay, "会后整理", f"无法读取会议记录：{e}")
+            QMessageBox.warning(owner, "会后整理", f"无法读取会议记录：{e}")
             return
         self._run_summary(t)
 
@@ -594,7 +647,7 @@ class App:
             return
         if tag == "start":
             if err:
-                self._set_status(f"无法启动 Copilot：{err}")
+                self._set_status(f"无法启动模型服务：{err}")
             else:
                 self._refresh_models()
                 self._refresh_quota()
@@ -623,7 +676,8 @@ class App:
             t = self._summary_target
             if err:
                 self._set_status(f"整理失败：{err}")
-                self.overlay.show()
+                if self.settings.show_overlay:
+                    self._show_overlay()
                 self.overlay.show_progress_error(f"整理失败：{err}")
                 self.tray.showMessage("会后整理失败", str(err), QSystemTrayIcon.MessageIcon.Warning, 8000)
             else:
@@ -634,23 +688,49 @@ class App:
                 self.overlay.show_progress_done(f"整理完成：{result.name}（{result.parent}）")
                 self.tray.showMessage("会后整理完成", f"{result.name}\n点击打开", _icon(), 8000)
                 open_path(result)
+        elif tag == "rebind":
+            if err:
+                self._set_status(f"切换模型服务失败：{err}")
         elif tag in ("login", "recheck") and isinstance(result, AuthState):
             pass  # 结果已通过 on_auth 处理
 
     def _on_auth(self, state: AuthState) -> None:
         self.auth = state
+        custom = self.settings.provider == "openai"
         if state.ok:
-            self._set_status(f"已登录 {state.login or ''}，Copilot 预热中…")
-            self.translator.prepare_selection(self.settings.model, self.settings.reasoning_effort)
+            self._set_status(f"{'已连接' if custom else '已登录'} {state.login or ''}，预热中…")
+            self.translator.prepare_selection(self._active_model(), self.settings.reasoning_effort)
             if self._login:
                 self._login.accept()
                 self._login = None
         else:
-            self._set_status("未登录 Copilot")
+            self._set_status(f"模型服务不可用：{state.message}" if custom else "未登录 Copilot")
             if self._login:
                 self._login.info.setText(state.message)
+            elif custom:
+                self._show_service_error(state.message)
             else:
                 self._show_login(state.message)
+
+    def _show_service_error(self, message: str) -> None:
+        """自定义端点起不来时直接进设置，而不是弹 Copilot 登录框。
+
+        这里不能用模态 QMessageBox：悬浮字幕窗是置顶窗口，普通弹窗会被它
+        盖住，看起来就像“弹窗点不了”。把错误直接写进设置窗口，用户也能
+        马上改接口地址 / 模型名 / API key。
+        """
+        self.open_settings()
+        dlg = self._settings_dlg
+        if dlg is None:
+            self._set_status(f"模型服务不可用：{message}")
+            return
+        dlg.set_service_error(f"{message}。请检查接口地址、模型名和 API key")
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _switch_to_custom(self) -> None:
+        self._set_status("请在「模型服务」里选择「自定义（OpenAI 兼容）」并新建一条端点")
+        self.open_settings()
 
     def _show_login(self, message: str) -> None:
         if self._login:
@@ -659,7 +739,10 @@ class App:
         dlg = LoginDialog(message, self.overlay)
         dlg.token_submitted.connect(lambda tok: self._watch(self.translator.login_with_token(tok), "login"))
         dlg.recheck_requested.connect(lambda: self._watch(self.translator.recheck_auth(), "recheck"))
+        dlg.use_custom_requested.connect(self._switch_to_custom)
         dlg.finished.connect(lambda _: setattr(self, "_login", None))
+        # 与设置窗同理：不置顶会被悬浮字幕窗盖住。
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self._login = dlg
         dlg.show()
 
@@ -704,7 +787,8 @@ class App:
         aic = self.translator.usage.aic
         self.usage_aic = aic
         if t is not None:
-            t.set_usage(aic, self.translator.model)
+            tokens = self.translator.usage.tokens if self.settings.provider == "openai" else None
+            t.set_usage(aic, self.translator.model, tokens)
             t.save()
             if self._meeting_price:
                 hours = (time.time() - t.started.timestamp()) / 3600
@@ -720,6 +804,8 @@ class App:
             self.transcript.set_translation(i, text, fixed)
         self.overlay.latency.setText(f"延迟 {tr.latency:.1f}s" + (f" ×{len(tr.ids)}" if len(tr.ids) > 1 else ""))
         self.overlay.render()
+        if self.settings.provider == "openai":
+            self._show_usage()
 
     def open_settings(self) -> None:
         """非模态：设置窗口打开时悬浮窗仍可操作，点哪个窗口就激活哪个。"""
@@ -730,17 +816,38 @@ class App:
             return
         dlg = SettingsDialog(
             self.settings,
-            self.models,
+            [] if self.settings.provider == "openai" else self.models,
             self.overlay,
             on_save_selection_history=self._save_selection_history,
             selection_history_path=SELECTION_HISTORY_FILE,
         )
         dlg.setModal(False)
+        # 悬浮字幕窗是 WindowStaysOnTopHint；设置窗不置顶就会被字幕盖住。
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._settings_dlg = dlg
 
         def refresh() -> None:
-            self._refresh_models(lambda r: dlg.set_models(self.models) if self._settings_dlg is dlg else None)
+            provider, profile = dlg.current_service()
+            if provider == "openai" and not profile:
+                dlg.set_models([])
+                dlg.set_model_error("先新建一条端点，填好接口地址、模型名和 API key")
+                return
+            dlg.set_models_loading()
+            fut = self.translator.list_models_for(profile) if provider == "openai" else self.translator.list_models()
+
+            def done(result) -> None:
+                if self._settings_dlg is not dlg:
+                    return
+                if isinstance(result, Exception):
+                    dlg.set_models([])
+                    dlg.set_model_error(str(result))
+                else:
+                    dlg.set_models(result)
+                    dlg.set_model_error("")
+                    dlg.set_service_error("")
+
+            self._watch(fut, ("cb", done))
 
         def bench(model: str, effort: str) -> None:
             self._watch(
@@ -764,13 +871,22 @@ class App:
         dlg.activateWindow()
 
     def _apply_settings(self, dlg: SettingsDialog) -> None:
+        old_service = self._service_key()
         old_hotkey = self.settings.hotkey
         old_selection_hotkey = self.settings.selection_hotkey
         old_model = (self.settings.model, self.settings.reasoning_effort)
         old_mic = self.settings.mic_enabled
         old_engine = (self.settings.effective_engine(), self.settings.asr_language())
         new_model = (dlg.model.currentData() or self.settings.model, dlg.effort.currentText())
+        custom = dlg.provider.currentData() == "openai"
         dlg.apply()
+        if self.settings.show_overlay:
+            self._show_overlay()
+        else:
+            self.overlay.hide()
+        if self._service_key() != old_service:
+            self._rebind_backend()
+            self._refresh_models()  # 换服务商后托盘菜单里的模型名也得跟着换
         self.overlay.apply_style(self.settings)
         self.selection_popup.apply_style(self.settings)
         self._show_usage()
@@ -780,7 +896,7 @@ class App:
             self.joiner.hold = self.settings.hold_seconds
             self.joiner.hold_max = self.settings.hold_max_seconds
             self.joiner.fillers = self.settings.fillers_zh if self.joiner.lang == "zh" else self.settings.fillers
-        if new_model != old_model:
+        if not custom and new_model != old_model:
             self.settings.model, self.settings.reasoning_effort = old_model
             self.set_model(*new_model)
         if self.settings.hotkey != old_hotkey:
@@ -790,16 +906,41 @@ class App:
         if self.state == IDLE and (self.settings.effective_engine(), self.settings.asr_language()) != old_engine:
             threading.Thread(target=self._preload_engine, daemon=True).start()
 
-    def _place_settings(self, dlg: SettingsDialog) -> None:
-        """悬浮窗可见时把设置窗口放到它旁边空间最大的一侧，避免互相遮挡。"""
-        if not self.overlay.isVisible():
+    def _service_key(self) -> tuple:
+        """服务商 + 端点配置的指纹：变了就要换后端。"""
+        profiles = tuple(sorted((p.get("name"), p.get("base_url"), p.get("model")) for p in self.settings.profiles))
+        return (self.settings.provider, self.settings.active_profile, profiles)
+
+    def _rebind_backend(self) -> None:
+        try:
+            backend = make_backend(self.settings, self.bridge.status.emit)
+        except Exception as e:  # 配置不完整：提示但不打断
+            QMessageBox.warning(self.overlay, "模型服务", str(e))
             return
-        screen = self.overlay.screen() or self.qapp.primaryScreen()
+        self._watch(self.translator.use_backend(backend), "rebind")
+
+    def _place_settings(self, dlg: SettingsDialog) -> None:
+        """把设置窗口收进屏幕内；悬浮窗在屏幕内时再放到它旁边空间最大的一侧。"""
+        rect = self.overlay.frameGeometry()
+        screen = self.overlay.screen() if self.overlay.isVisible() else None
+        if screen is not None:
+            hit = rect.intersected(screen.availableGeometry())
+            if hit.width() < 120 or hit.height() < 60:
+                screen = None  # 悬浮窗在屏幕外，别跟着它跑
+        screen = screen or self.qapp.primaryScreen()
         if screen is None:
             return
-        dlg.adjustSize()
-        size = dlg.sizeHint().expandedTo(dlg.minimumSizeHint()) + FRAME_ALLOWANCE
-        dlg.move(place_beside(self.overlay.frameGeometry(), size, screen.availableGeometry()))
+        avail = screen.availableGeometry()
+        dlg.fit_to_screen(avail)
+        hit = rect.intersected(avail)
+        if hit.width() >= 120 and hit.height() >= 60:
+            point = place_beside(rect, dlg.size(), avail)
+            dlg.move(point)
+        else:
+            dlg.move(
+                avail.left() + max(0, (avail.width() - dlg.width()) // 2),
+                avail.top() + max(0, (avail.height() - dlg.height()) // 2),
+            )
 
     def quit(self) -> None:
         if self.state != IDLE:
@@ -824,6 +965,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
     )
+    if not qtcom.gui_thread_is_sta():
+        # COM 已被别的库设成 MTA，原生文件对话框会卡死：退回 Qt 自己画的对话框。
+        log.warning("COM 线程不是 STA，改用 Qt 内置对话框")
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
     app = App(qapp)  # noqa: F841

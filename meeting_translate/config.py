@@ -50,7 +50,7 @@ def find_model(name: str) -> Path | None:
 
 DEFAULT_FILLERS = ["え", "あ", "えー", "えーと", "あの", "うん", "ん"]
 DEFAULT_FILLERS_ZH = ["嗯", "啊", "呃", "哦", "额", "那个", "就是"]
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 
 @dataclass
@@ -85,11 +85,27 @@ class Settings:
     asr_correct: bool = True  # 翻译时让 LLM 一并校正识别原文
     font_size: int = 16
     opacity: float = 0.85
+    show_overlay: bool = True  # 是否显示置顶悬浮字幕窗（关闭后只留托盘和快捷键）
+    subtitle_mode: bool = False  # 字幕模式：悬浮窗只显示译文，不显示原文和未翻译片段
     window_geometry: list[int] = field(default_factory=lambda: [200, 600, 900, 260])
     show_quota_remaining: bool = False  # 悬浮窗显示「账户剩余 %」（低于阈值时仍强制显示）
     show_quota_used: bool = True  # 悬浮窗显示「账户已用 AIC」
     show_meeting_aic: bool = True  # 悬浮窗显示「本场 AIC」
     save_dir: str | None = None  # 会议记录保存目录；None = 尚未设定，结束会议时询问
+    provider: str = "copilot"  # copilot | openai（自定义端点）
+    active_profile: str = ""  # 自定义端点里当前选中的那条；空 = 仍用 Copilot
+    # 每条自定义端点：name / base_url / model / api_key（dpapi 密文）/
+    # input_price / output_price（元每百万 token）/ verify_tls
+    profiles: list[dict] = field(default_factory=list)
+
+    def profile(self, name: str | None = None) -> dict | None:
+        target = name or self.active_profile
+        if not target:
+            return None
+        for p in self.profiles:
+            if p.get("name") == target:
+                return p
+        return None
 
     def effective_engine(self) -> str:
         return "sensevoice" if self.direction == "zh-ja" else self.asr_engine
@@ -108,6 +124,11 @@ class Settings:
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                 if data.get("version", 1) < 2:
                     data.pop("max_segment_seconds", None)  # v1 的 6 秒强制切分改为 10 秒
+                    data["version"] = SETTINGS_VERSION
+                if data.get("version", 1) < 3:
+                    data.setdefault("provider", "copilot")  # v2 之前只有 Copilot
+                    data.setdefault("active_profile", "")
+                    data.setdefault("profiles", [])
                     data["version"] = SETTINGS_VERSION
                 s = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
                 if s.asr_engine == "funasr-nano":  # 已移除的引擎，回落到默认

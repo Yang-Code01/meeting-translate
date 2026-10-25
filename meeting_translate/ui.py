@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QPainter
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -39,9 +39,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import audio, lang, stats
+from . import audio, lang, secrets, stats
 from .asr import downloadable, model_ready, model_target_dir
 from .config import HF_BASE, Settings
+from .openai_backend import normalize_base_url
 from .transcript import Entry, fmt_aic
 from .translator import ModelOption
 
@@ -52,7 +53,26 @@ ENGINES = [
     ("whisper-small", "Whisper small"),
     ("whisper-medium", "Whisper medium"),
 ]
-EFFORTS = ["none", "low", "medium", "high", "default"]
+EFFORTS = ["none", "low", "medium", "high", "xhigh", "max", "default"]
+
+
+def effort_choices(opt: ModelOption | None) -> list[str]:
+    """模型声明的思考档位；没有声明时回退到通用列表。"""
+    if opt is None:
+        return list(EFFORTS)
+    values: list[str] = []
+    if opt.can_disable_thinking:
+        values.append("none")
+    for value in opt.efforts:
+        if value and value not in values:
+            values.append(value)
+    if not values:
+        return list(EFFORTS)
+    if "default" not in values:
+        values.append("default")
+    return values
+
+
 SPEAKER_COLORS = {audio.THEM: "#7fd1ff", audio.ME: "#ffd27f"}
 BUTTON_STYLE = (
     "QPushButton{color:#eee;background:rgba(255,255,255,30);border:none;padding:2px 8px;border-radius:4px}"
@@ -63,7 +83,61 @@ MIC_ON_STYLE = (
     "QPushButton:hover{background:rgba(46,160,67,255)}"
 )
 DIALOG_GAP = 8
-FRAME_ALLOWANCE = QSize(16, 40)  # 对话框标题栏/边框，显示前取不到真实值
+EDGE_DOUBLE_CLICK = 16  # 双击窗口边缘多少像素内切换全屏
+
+
+def flexible_combo(combo: QComboBox, chars: int = 12) -> QComboBox:
+    """下拉框的最小宽度按固定字符数计算。
+
+    QComboBox 默认的最小宽度取最长条目，很长的设备名/模型名会把 QFormLayout
+    的整行挤到下一行，字段就和其它行对不齐了。
+    """
+    combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(chars)
+    return combo
+
+
+class ElidedLabel(QLabel):
+    """文字过长时省略显示，不把父窗口的最小宽度撑大。
+
+    顶栏状态/延迟/用量都是单行 QLabel；默认 QLabel 的 minimumSizeHint()
+    等于整段文字宽度，状态里一旦带上长文件路径，悬浮窗就再也缩不回去。
+    这里保留完整文本到 tooltip，只在绘制时按当前宽度省略。
+    """
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__("", parent)
+        self._full_text = ""
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self._apply_elide()
+        self.updateGeometry()
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        fm = self.fontMetrics()
+        margins = self.contentsMargins()
+        return QSize(
+            fm.horizontalAdvance(self._full_text) + margins.left() + margins.right(),
+            fm.height() + margins.top() + margins.bottom(),
+        )
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(0, self.sizeHint().height())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        width = max(0, self.contentsRect().width())
+        elided = self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, width)
+        if QLabel.text(self) != elided:
+            QLabel.setText(self, elided)
 
 
 def place_beside(anchor: QRect, size: QSize, screen: QRect, gap: int = DIALOG_GAP) -> QPoint:
@@ -81,6 +155,14 @@ def place_beside(anchor: QRect, size: QSize, screen: QRect, gap: int = DIALOG_GA
     def clamp(v: int, lo: int, hi: int) -> int:
         return max(lo, min(v, hi))
 
+    def clamp_point(x: int, y: int) -> QPoint:
+        # 锚点可能在屏幕外（比如悬浮窗被拖到了拔掉的显示器上），
+        # 算出来的位置必须收回屏幕内，否则窗口会整个消失。
+        return QPoint(
+            clamp(x, screen.left(), screen.right() - w + 1),
+            clamp(y, screen.top(), screen.bottom() - h + 1),
+        )
+
     if not fitting:
         return QPoint(screen.left() + max(0, (screen.width() - w) // 2), screen.top() + max(0, (screen.height() - h) // 2))
     side = max(fitting, key=lambda k: spaces[k] - need[k])
@@ -90,7 +172,69 @@ def place_beside(anchor: QRect, size: QSize, screen: QRect, gap: int = DIALOG_GA
     else:
         y = anchor.bottom() + gap + 1 if side == "below" else anchor.top() - gap - h
         x = clamp(anchor.left(), screen.left(), screen.right() - w + 1)
-    return QPoint(x, y)
+    return clamp_point(x, y)
+
+
+class CornerGrip(QWidget):
+    """悬浮窗四角的缩放手柄；拖动时从对应的角改变窗口几何。"""
+
+    def __init__(self, overlay: "Overlay", corner: str) -> None:
+        super().__init__(overlay)
+        self._overlay = overlay
+        self._corner = corner
+        self._start_global: QPoint | None = None
+        self._start_geometry = QRect()
+        self.setFixedSize(12, 12)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setCursor(
+            Qt.CursorShape.SizeFDiagCursor
+            if corner in ("tl", "br")
+            else Qt.CursorShape.SizeBDiagCursor
+        )
+        self.setToolTip("拖动调整窗口大小")
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._start_global = e.globalPosition().toPoint()
+            self._start_geometry = self._overlay.geometry()
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        if self._start_global is None or not (e.buttons() & Qt.MouseButton.LeftButton):
+            super().mouseMoveEvent(e)
+            return
+        delta = e.globalPosition().toPoint() - self._start_global
+        left, top = self._start_geometry.left(), self._start_geometry.top()
+        right, bottom = self._start_geometry.right(), self._start_geometry.bottom()
+        if "l" in self._corner:
+            left += delta.x()
+        if "r" in self._corner:
+            right += delta.x()
+        if "t" in self._corner:
+            top += delta.y()
+        if "b" in self._corner:
+            bottom += delta.y()
+        minimum = self._overlay.minimumSizeHint()
+        min_w, min_h = max(1, minimum.width()), max(1, minimum.height())
+        if right - left + 1 < min_w:
+            if "l" in self._corner:
+                left = right - min_w + 1
+            else:
+                right = left + min_w - 1
+        if bottom - top + 1 < min_h:
+            if "t" in self._corner:
+                top = bottom - min_h + 1
+            else:
+                bottom = top + min_h - 1
+        self._overlay.setGeometry(QRect(QPoint(left, top), QPoint(right, bottom)))
+        e.accept()
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        self._start_global = None
+        self._overlay._emit_geometry()
+        e.accept()
 
 
 class Overlay(QWidget):
@@ -107,14 +251,18 @@ class Overlay(QWidget):
         self.setWindowTitle("会议翻译")
         self._opacity = settings.opacity
         self._font_size = settings.font_size
+        self._subtitle_mode = settings.subtitle_mode
         self._drag: QPoint | None = None
+        self._fullscreen = False
+        self._normal_geometry: QRect | None = None
         self._progress_token = 0
         self.entries: list[Entry] = []
         self.partials: dict[str, str] = {}
 
-        self.status = QLabel("启动中…")
-        self.latency = QLabel("")
-        self.usage = QLabel("")
+        self.status = ElidedLabel("启动中…")
+        self.status.setMinimumWidth(80)  # 再窄也保留一点状态提示，但不让它撑住窗口
+        self.latency = ElidedLabel("")
+        self.usage = ElidedLabel("")
         self.btn_mic = QPushButton()
         self.btn_mic.setCheckable(True)
         self.btn_toggle = QPushButton("▶ 开始")
@@ -177,23 +325,40 @@ class Overlay(QWidget):
         self.view.setFrameShape(QTextBrowser.Shape.NoFrame)
         self.view.setStyleSheet("background:transparent;color:white;")
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-        grip_row = QHBoxLayout()
-        grip_row.addStretch(1)
-        grip_row.addWidget(QSizeGrip(self))
+        for w in (self.status, self.latency, self.usage, self.view.viewport()):
+            w.installEventFilter(self)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 6, 6, 2)
         lay.addLayout(bar)
         lay.addWidget(self.progress)
         lay.addWidget(self.view, 1)
-        lay.addLayout(grip_row)
+
+        self._corner_grips = {name: CornerGrip(self, name) for name in ("tl", "tr", "bl", "br")}
         self.setGeometry(*settings.window_geometry)
+        self.ensure_on_screen()
         self.apply_style(settings)
+
+    def ensure_on_screen(self) -> None:
+        """显示器拔插/分辨率变化后，别把窗口留在屏幕外。"""
+        rect = self.frameGeometry()
+        for screen in QGuiApplication.screens():
+            hit = rect.intersected(screen.availableGeometry())
+            if hit.width() >= 120 and hit.height() >= 60:
+                return
+        primary = QGuiApplication.primaryScreen()
+        if primary is None:
+            return
+        area = primary.availableGeometry()
+        self.move(
+            max(area.left(), area.right() - self.width() - 24),
+            max(area.top(), area.bottom() - self.height() - 60),
+        )
 
     def apply_style(self, settings: Settings) -> None:
         self._opacity = settings.opacity
         self._font_size = settings.font_size
+        self._subtitle_mode = settings.subtitle_mode
         self.view.setFont(QFont("Microsoft YaHei UI", settings.font_size))
         self.update()
         self.render()
@@ -220,7 +385,64 @@ class Overlay(QWidget):
 
     def resizeEvent(self, e) -> None:  # noqa: N802
         super().resizeEvent(e)
-        self._emit_geometry()
+        self._place_corner_grips()
+        if not self._fullscreen:  # 全屏尺寸不写回配置，退出时恢复原窗口
+            self._emit_geometry()
+
+    def _place_corner_grips(self) -> None:
+        if not hasattr(self, "_corner_grips"):
+            return
+        size = 12
+        w, h = self.width(), self.height()
+        positions = {"tl": (0, 0), "tr": (w - size, 0), "bl": (0, h - size), "br": (w - size, h - size)}
+        for name, grip in self._corner_grips.items():
+            grip.move(*positions[name])
+            grip.raise_()
+
+    def mouseDoubleClickEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton and self._is_edge_point(e.position().toPoint()):
+            self.toggle_fullscreen()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def eventFilter(self, obj, event) -> bool:
+        if (
+            event.type() == QEvent.Type.MouseButtonDblClick
+            and isinstance(obj, QWidget)
+            and self.isAncestorOf(obj)
+            and self._is_edge_point(obj.mapTo(self, event.position().toPoint()))
+        ):
+            self.toggle_fullscreen()
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _is_edge_point(self, pos: QPoint) -> bool:
+        return (
+            pos.x() <= EDGE_DOUBLE_CLICK
+            or pos.y() <= EDGE_DOUBLE_CLICK
+            or pos.x() >= self.width() - 1 - EDGE_DOUBLE_CLICK
+            or pos.y() >= self.height() - 1 - EDGE_DOUBLE_CLICK
+        )
+
+    def toggle_fullscreen(self) -> None:
+        """双击边缘在全屏和原来的窗口大小之间切换。"""
+        if self.isFullScreen():
+            self._fullscreen = False
+            self.showNormal()
+            if self._normal_geometry is not None:
+                self.setGeometry(self._normal_geometry)
+            self._normal_geometry = None
+            self.ensure_on_screen()
+            for grip in self._corner_grips.values():
+                grip.show()
+        else:
+            self._normal_geometry = self.geometry()
+            self._fullscreen = True
+            self.showFullScreen()
+            for grip in self._corner_grips.values():
+                grip.hide()
 
     def _emit_geometry(self) -> None:
         g = self.geometry()
@@ -297,23 +519,33 @@ class Overlay(QWidget):
     def render(self) -> None:
         ja_size = max(9, int(self._font_size * 0.75))
         rows = []
-        for e in self.entries[-MAX_VISIBLE_ENTRIES:]:
-            color = SPEAKER_COLORS.get(e.source, "#ccc")
-            ja = f"<span style='color:{color};font-size:{ja_size}pt'>【{e.source}】{html.escape(e.ja)}</span>"
-            if e.zh == "":  # 语气词：只显示不翻译
-                rows.append(f"<div style='margin-bottom:6px'>{ja}</div>")
-                continue
-            zh = html.escape(e.zh) if e.zh else "<span style='color:#888'>…</span>"
-            rows.append(
-                f"<div style='margin-bottom:6px'>{ja}<br>"
-                f"<span style='font-size:{self._font_size}pt'>{zh}</span></div>"
-            )
-        for src, text in self.partials.items():
-            if text:
-                color = SPEAKER_COLORS.get(src, "#ccc")
+        if self._subtitle_mode:
+            # 视频字幕：只保留已有译文，不显示原文、说话方标签和未完成的识别片段。
+            for e in self.entries[-MAX_VISIBLE_ENTRIES:]:
+                text = (e.zh or "").strip()
+                if text:
+                    rows.append(
+                        f"<div style='margin-bottom:6px'>"
+                        f"<span style='font-size:{self._font_size}pt'>{html.escape(text)}</span></div>"
+                    )
+        else:
+            for e in self.entries[-MAX_VISIBLE_ENTRIES:]:
+                color = SPEAKER_COLORS.get(e.source, "#ccc")
+                ja = f"<span style='color:{color};font-size:{ja_size}pt'>【{e.source}】{html.escape(e.ja)}</span>"
+                if e.zh == "":  # 语气词：只显示不翻译
+                    rows.append(f"<div style='margin-bottom:6px'>{ja}</div>")
+                    continue
+                zh = html.escape(e.zh) if e.zh else "<span style='color:#888'>…</span>"
                 rows.append(
-                    f"<div style='color:{color};font-size:{ja_size}pt'><i>【{src}】{html.escape(text)} …</i></div>"
+                    f"<div style='margin-bottom:6px'>{ja}<br>"
+                    f"<span style='font-size:{self._font_size}pt'>{zh}</span></div>"
                 )
+            for src, text in self.partials.items():
+                if text:
+                    color = SPEAKER_COLORS.get(src, "#ccc")
+                    rows.append(
+                        f"<div style='color:{color};font-size:{ja_size}pt'><i>【{src}】{html.escape(text)} …</i></div>"
+                    )
         self.view.setHtml("".join(rows))
         sb = self.view.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -705,6 +937,89 @@ def model_tooltip(o: ModelOption) -> str:
     return f"{o.id}\n输入 {o.input_price:g} / 输出 {o.output_price:g} AIC 每百万 token"
 
 
+class ProfileDialog(QDialog):
+    """编辑一条自定义端点（OpenAI 兼容）。key 只在提交时加密。"""
+
+    def __init__(self, profile: dict | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("模型服务")
+        self.setMinimumWidth(560)
+        self._existing = dict(profile or {})
+        form = QFormLayout(self)
+
+        self.name = QLineEdit(self._existing.get("name", ""))
+        self.name.setPlaceholderText("例如 DeepSeek / 公司网关 / 本地 Ollama")
+        self.base_url = QLineEdit(self._existing.get("base_url", ""))
+        self.base_url.setPlaceholderText("https://api.deepseek.com/v1")
+        self.model_name = QLineEdit(self._existing.get("model", ""))
+        self.model_name.setPlaceholderText("deepseek-chat；留空则用 /models 返回的第一项")
+        self.api_key = QLineEdit()
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText(
+            "已保存，留空则不修改" if secrets.looks_encrypted(self._existing.get("api_key", "")) else "sk-…"
+        )
+        self.price_in = self._price(self._existing.get("input_price"))
+        self.price_out = self._price(self._existing.get("output_price"))
+        self.verify = QCheckBox("忽略证书校验（仅内网自签证书时勾选）")
+        self.verify.setChecked(not self._existing.get("verify_tls", True))
+        self.verify.setToolTip("只对这条端点生效。勾选后无法验证对端身份，公网端点请勿开启")
+
+        form.addRow("名称", self.name)
+        form.addRow("接口地址", self.base_url)
+        form.addRow("模型名", self.model_name)
+        form.addRow("API key", self.api_key)
+        form.addRow("输入单价", self.price_in)
+        form.addRow("输出单价", self.price_out)
+        form.addRow("", self.verify)
+        form.addRow(
+            QLabel("<small>单价用于折算「本场花费」，可留 0 表示不折算。key 用 Windows DPAPI 加密后存进 config.json。</small>")
+        )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._ok)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    @staticmethod
+    def _price(value) -> QDoubleSpinBox:
+        box = QDoubleSpinBox()
+        box.setRange(0.0, 1000.0)
+        box.setDecimals(3)
+        box.setSingleStep(0.1)
+        box.setSuffix(" 元/百万 token")
+        box.setSpecialValueText("不折算")
+        box.setValue(float(value) if value else 0.0)
+        return box
+
+    def _ok(self) -> None:
+        base_url = normalize_base_url(self.base_url.text())
+        if not self.name.text().strip() or not base_url:
+            QMessageBox.warning(self, "模型服务", "名称和接口地址都不能为空。")
+            return
+        if not base_url.startswith(("http://", "https://")):
+            QMessageBox.warning(self, "模型服务", "接口地址要以 http:// 或 https:// 开头。")
+            return
+        if not self.api_key.text().strip() and not self._existing.get("api_key"):
+            QMessageBox.warning(self, "模型服务", "请填写 API key。")
+            return
+        self.base_url.setText(base_url)  # 顺手补全协议头，保存后配置里就是可直接用的地址
+        self.accept()
+
+    def result_profile(self) -> dict:
+        p = dict(self._existing)
+        p["name"] = self.name.text().strip()
+        p["base_url"] = normalize_base_url(self.base_url.text())
+        p["model"] = self.model_name.text().strip()
+        key = self.api_key.text().strip()
+        if key:
+            p["api_key"] = secrets.protect(key)
+        p["api_key"] = p.get("api_key", "")
+        p["input_price"] = self.price_in.value() or None
+        p["output_price"] = self.price_out.value() or None
+        p["verify_tls"] = not self.verify.isChecked()
+        return p
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -721,22 +1036,31 @@ class SettingsDialog(QDialog):
         self.s = settings
         self._on_refresh = on_refresh
         self._on_bench = on_bench
-        form = QFormLayout(self)
+        form = QFormLayout()
+        # 长行换行会把字段顶到第一列，和上下行对不齐；宁可让下拉框省略文字。
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
 
-        self.speaker = QComboBox()
+        # 启动失败等严重错误显示在表单最上方：不用滚动就能看到。
+        self.service_error = QLabel("")
+        self.service_error.setWordWrap(True)
+        self.service_error.setStyleSheet("color:#e06c75")
+        self.service_error.hide()
+        form.addRow(self.service_error)
+
+        self.speaker = flexible_combo(QComboBox())
         self.speaker.addItem("系统默认", None)
         for n in audio.list_speakers():
             self.speaker.addItem(n, n)
         self._select(self.speaker, settings.loopback_device)
 
-        self.mic = QComboBox()
+        self.mic = flexible_combo(QComboBox())
         self.mic.addItem("不翻译麦克风", "__off__")
         self.mic.addItem("系统默认", None)
         for n in audio.list_microphones():
             self.mic.addItem(n, n)
         self._select(self.mic, settings.mic_device if settings.mic_enabled else "__off__")
 
-        self.direction = QComboBox()
+        self.direction = flexible_combo(QComboBox())
         for d in lang.DIRECTIONS.values():
             note = "（SenseVoice 识别" + ("）" if model_ready("sensevoice") else "，需下载约 230MB）")
             self.direction.addItem(d.label + (note if d.key == lang.ZH_JA else ""), d.key)
@@ -747,13 +1071,35 @@ class SettingsDialog(QDialog):
         direction_row.addWidget(self.direction, 1)
         direction_row.addWidget(self.direction_note)
 
-        self.engine = QComboBox()
+        self.engine = flexible_combo(QComboBox())
         for key, label in ENGINES:
             self.engine.addItem(label + ("" if model_ready(key) else "（需下载）"), key)
         self._select(self.engine, settings.asr_engine)
 
-        self.model = QComboBox()
-        self.model.setMinimumWidth(460)
+        self.provider = flexible_combo(QComboBox())
+        self.provider.addItem("GitHub Copilot", "copilot")
+        self.provider.addItem("自定义（OpenAI 兼容）", "openai")
+        self._select(self.provider, settings.provider)
+
+        self.profiles: list[dict] = [dict(p) for p in settings.profiles]
+        self.profile_combo = flexible_combo(QComboBox(), 12)
+        self._reload_profiles(settings.active_profile)
+        self.btn_profile_new = QPushButton("新建…")
+        self.btn_profile_edit = QPushButton("编辑…")
+        self.btn_profile_del = QPushButton("删除")
+        self.btn_profile_new.clicked.connect(self._new_profile)
+        self.btn_profile_edit.clicked.connect(self._edit_profile)
+        self.btn_profile_del.clicked.connect(self._delete_profile)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_combo, 1)
+        profile_row.addWidget(self.btn_profile_new)
+        profile_row.addWidget(self.btn_profile_edit)
+        profile_row.addWidget(self.btn_profile_del)
+        self.provider_note = QLabel("")
+        self.provider_note.setStyleSheet("color:#888")
+        self.provider_note.setWordWrap(True)
+
+        self.model = flexible_combo(QComboBox(), 16)
         self.btn_refresh = QPushButton("刷新")
         self.btn_bench = QPushButton("测速")
         self.btn_refresh.clicked.connect(self._refresh)
@@ -770,6 +1116,7 @@ class SettingsDialog(QDialog):
         self.effort = QComboBox()
         self.effort.addItems(EFFORTS)
         self.effort.setCurrentText(settings.reasoning_effort)
+        self._sync_effort_choices()
 
         self.rotate = QSpinBox()
         self.rotate.setRange(5, 240)
@@ -795,6 +1142,11 @@ class SettingsDialog(QDialog):
         self.opacity.setRange(0.2, 1.0)
         self.opacity.setSingleStep(0.05)
         self.opacity.setValue(settings.opacity)
+        self.show_overlay = QCheckBox("显示悬浮字幕窗（关闭后只留托盘图标和快捷键）")
+        self.show_overlay.setChecked(settings.show_overlay)
+        self.subtitle_mode = QCheckBox("字幕模式：只显示译文，不显示原文")
+        self.subtitle_mode.setToolTip("适合看视频时当字幕用；未完成的原文片段和语气词不显示")
+        self.subtitle_mode.setChecked(settings.subtitle_mode)
 
         self.hotkey = QLineEdit(settings.hotkey)
         self.selection_hotkey = QLineEdit(settings.selection_hotkey)
@@ -835,8 +1187,10 @@ class SettingsDialog(QDialog):
         self.show_meeting = QCheckBox("本场 AIC")
         self.show_meeting.setChecked(settings.show_meeting_aic)
         display_box = QVBoxLayout()
-        for w in (self.show_remaining, self.show_used, self.show_meeting):
+        self._overlay_option_boxes = (self.show_remaining, self.show_used, self.show_meeting)
+        for w in self._overlay_option_boxes:
             display_box.addWidget(w)
+        self.show_overlay.toggled.connect(self._sync_overlay_options)
 
         self.btn_save_selection_history = QPushButton("保存划词/句翻译历史")
         if on_save_selection_history is not None:
@@ -872,9 +1226,12 @@ class SettingsDialog(QDialog):
         form.addRow("翻译方向", direction_row)
         form.addRow("语音识别引擎（日→中）", self.engine)
         form.addRow("识别纠错", self.asr_correct)
+        form.addRow("模型服务", self.provider)
+        form.addRow("端点", profile_row)
+        form.addRow("", self.provider_note)
         form.addRow("翻译模型", model_row)
         form.addRow("", self.model_info)
-        form.addRow("推理强度", self.effort)
+        form.addRow("推理强度（思考档位）", self.effort)
         form.addRow("会话轮换间隔", self.rotate)
         form.addRow("断句：静音判定", self.silence)
         form.addRow("断句：未说完最多等待", self.hold)
@@ -883,29 +1240,53 @@ class SettingsDialog(QDialog):
         form.addRow("语气词·中文（不翻译）", self.fillers_zh)
         form.addRow("译文字号", self.font)
         form.addRow("背景不透明度", self.opacity)
+        form.addRow("悬浮框", self.show_overlay)
+        form.addRow("字幕模式", self.subtitle_mode)
         form.addRow("开始/暂停快捷键", self.hotkey)
         form.addRow("划词/句翻译快捷键", self.selection_hotkey)
         form.addRow("划词/句翻译：中文译文", chinese_row)
         form.addRow("划词/句翻译：假名", kana_row)
         form.addRow("划词/句翻译：汉字", kanji_row)
-        form.addRow("显示设置：悬浮窗显示", display_box)
+        form.addRow("悬浮窗显示内容", display_box)
         form.addRow("翻译历史", history_row)
         form.addRow("会议记录保存位置", save_row)
-        form.addRow(
-            QLabel(
-                "<small>模型与推理强度、麦克风开关在会议中修改会立即生效；"
-                "设备、翻译方向、识别引擎、识别纠错、静音判定在下一次「开始」时生效。</small>"
-            )
+        hint = QLabel(
+            "<small>模型与推理强度、麦克风开关在会议中修改会立即生效；"
+            "设备、翻译方向、识别引擎、识别纠错、静音判定在下一次「开始」时生效。</small>"
         )
+        hint.setWordWrap(True)
+        form.addRow(hint)
         self.dirty_hint = QLabel("")
         self.dirty_hint.setStyleSheet("color:#d9822b")
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.dirty_hint, 1, Qt.AlignmentFlag.AlignRight)
-        button_row.addWidget(buttons)
-        form.addRow(button_row)
+        self.btn_defaults = QPushButton("默认")
+        self.btn_defaults.setToolTip("把所有设置恢复为默认值（自定义模型端点保留），点击 OK 后生效")
+        self.btn_defaults.setAutoDefault(False)
+        self.btn_defaults.clicked.connect(self._confirm_restore_defaults)
+
+        # 表单放滚动区，按钮固定在底部：设置项只增不减，窗口必须能缩，
+        # 否则 125% 缩放下 843px 的高度会让 OK/取消 掉到屏幕外。
+        content = QWidget()
+        content.setLayout(form)
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(content)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        footer = QWidget()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(12, 6, 12, 12)
+        footer_layout.addWidget(self.dirty_hint, 1, Qt.AlignmentFlag.AlignRight)
+        footer_layout.addWidget(self.btn_defaults)
+        footer_layout.addWidget(buttons)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self.scroll, 1)
+        outer.addWidget(footer)
+        self.setMinimumSize(660, 420)
+        self.resize(760, 620)
 
         self._getters: dict[str, Callable[[], object]] = {
             "speaker": self.speaker.currentData,
@@ -913,7 +1294,9 @@ class SettingsDialog(QDialog):
             "direction": self.direction.currentData,
             "engine": self.engine.currentData,
             "asr_correct": self.asr_correct.isChecked,
-            "model": lambda: self.model.currentData() or self.s.model,
+            "provider": self.provider.currentData,
+            "profile": lambda: self.profile_combo.currentData() or "",
+            "model": lambda: self.model.currentData() or self.model.currentText().strip() or self.s.model,
             "effort": self.effort.currentText,
             "rotate": self.rotate.value,
             "silence": self.silence.value,
@@ -923,6 +1306,8 @@ class SettingsDialog(QDialog):
             "fillers_zh": self.fillers_zh.text,
             "font": self.font.value,
             "opacity": self.opacity.value,
+            "show_overlay": self.show_overlay.isChecked,
+            "subtitle_mode": self.subtitle_mode.isChecked,
             "hotkey": self.hotkey.text,
             "selection_hotkey": self.selection_hotkey.text,
             "chinese_size": self.chinese_size.value,
@@ -940,6 +1325,7 @@ class SettingsDialog(QDialog):
         self._baseline = {k: f() for k, f in self._getters.items()}
         for w in (self.speaker, self.mic, self.direction, self.engine, self.model, self.effort):
             w.currentIndexChanged.connect(self._update_dirty)
+        self.model.currentIndexChanged.connect(self._sync_effort_choices)
         for w in (
             self.rotate, self.silence, self.hold, self.hold_max, self.font, self.opacity,
             self.chinese_size, self.kana_size, self.kanji_size,
@@ -949,18 +1335,137 @@ class SettingsDialog(QDialog):
             w.colorChanged.connect(self._update_dirty)
         for w in (self.fillers, self.fillers_zh, self.hotkey, self.selection_hotkey, self.save_dir):
             w.textChanged.connect(self._update_dirty)
-        for w in (self.show_remaining, self.show_used, self.show_meeting, self.asr_correct, self.show_kanji):
+        for w in (
+            self.show_remaining, self.show_used, self.show_meeting,
+            self.show_overlay, self.subtitle_mode, self.asr_correct, self.show_kanji,
+        ):
             w.toggled.connect(self._update_dirty)
         self.direction.currentIndexChanged.connect(self._sync_engine_enabled)
+        self.provider.currentIndexChanged.connect(self._sync_provider)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         self._meeting_active = False
         self._sync_engine_enabled()
+        self._sync_overlay_options()
+        self._sync_provider()
         self._sync_kanji_enabled()
+
+    # ---- 服务商与模型 ----
+
+    def current_profile(self) -> dict | None:
+        name = self.profile_combo.currentData()
+        for p in self.profiles:
+            if p.get("name") == name:
+                return p
+        return None
+
+    def current_service(self) -> tuple[str, dict | None]:
+        """设置窗口此刻编辑的服务：("copilot"|"openai", 端点配置或 None)。"""
+        return self.provider.currentData() or "copilot", self.current_profile()
+
+    def _desired_model(self) -> str:
+        if self.provider.currentData() == "openai":
+            return (self.current_profile() or {}).get("model") or ""
+        return self.s.model
+
+    def _stash_model(self) -> None:
+        """把选中的模型写回端点配置：自定义端点的模型名只有一个真相来源。"""
+        profile = self.current_profile()
+        if self.provider.currentData() != "openai" or profile is None:
+            return
+        mid = self.model.currentData() or self.model.currentText().strip()
+        if mid:
+            profile["model"] = mid
+
+    def _request_refresh(self) -> None:
+        if self._on_refresh is not None:
+            self._on_refresh()
+
+    def _on_profile_changed(self) -> None:
+        self._update_dirty()
+        self._request_refresh()
+
+    def set_models_loading(self) -> None:
+        self.model_info.setText("<small>正在从该端点获取模型列表…</small>")
+
+    def set_model_error(self, text: str) -> None:
+        if text:
+            self.model_info.setText(f"<small style='color:#c33'>{html.escape(text)}</small>")
+
+    def set_service_error(self, text: str) -> None:
+        self.service_error.setText(text)
+        self.service_error.setVisible(bool(text))
+
+    def fit_to_screen(self, avail: QRect) -> None:
+        """初始尺寸不超过可用区域的 92%：小屏或高缩放比例下 OK/取消 也要够得着。"""
+        width = max(self.minimumWidth(), min(self.width(), int(avail.width() * 0.92)))
+        height = max(self.minimumHeight(), min(self.height(), int(avail.height() * 0.92)))
+        self.resize(width, height)
 
     def is_dirty(self) -> bool:
         return any(f() != self._baseline[k] for k, f in self._getters.items())
 
     def _update_dirty(self) -> None:
         self.dirty_hint.setText("设置已修改，点击 OK 后生效" if self.is_dirty() else "")
+
+    def _confirm_restore_defaults(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "恢复默认设置",
+            "把所有设置恢复为默认值？\n自定义模型端点（含 API key）会保留。点击 OK 后才生效。",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._restore_defaults()
+
+    def _restore_defaults(self) -> None:
+        """把对话框里的控件恢复成 Settings() 的默认值；不写盘，点 OK 才应用。"""
+        d = Settings()
+        self._select(self.speaker, d.loopback_device)
+        self._select(self.mic, d.mic_device if d.mic_enabled else "__off__")
+        if not self._meeting_active:
+            self._select(self.direction, d.direction)
+        self._select(self.engine, d.asr_engine)
+        self._select(self.provider, d.provider)
+        # 切回 Copilot 后模型列表要异步重拉；先放一个默认项占位，
+        # 列表回来时 set_models() 会按 currentData 重新选中它。
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItem(d.model, d.model)
+        self.model.blockSignals(False)
+        if self._models:
+            self.set_models(self._models)
+        self.effort.setCurrentText(d.reasoning_effort)
+        self._sync_effort_choices()
+        self.rotate.setValue(d.session_rotate_minutes)
+        self.silence.setValue(d.silence_seconds)
+        self.hold.setValue(d.hold_seconds)
+        self.hold_max.setValue(d.hold_max_seconds)
+        self.asr_correct.setChecked(d.asr_correct)
+        self.fillers.setText("、".join(d.fillers))
+        self.fillers_zh.setText("、".join(d.fillers_zh))
+        self.font.setValue(d.font_size)
+        self.opacity.setValue(d.opacity)
+        self.show_overlay.setChecked(d.show_overlay)
+        self.subtitle_mode.setChecked(d.subtitle_mode)
+        self.hotkey.setText(d.hotkey)
+        self.selection_hotkey.setText(d.selection_hotkey)
+        self.chinese_size.setValue(d.selection_chinese_px)
+        self.chinese_color.set_color(d.selection_chinese_color)
+        self.kana_size.setValue(d.selection_kana_px)
+        self.kana_color.set_color(d.selection_kana_color)
+        self.kanji_size.setValue(d.selection_kanji_px)
+        self.kanji_color.set_color(d.selection_kanji_color)
+        self.show_kanji.setChecked(d.selection_show_kanji)
+        self.show_remaining.setChecked(d.show_quota_remaining)
+        self.show_used.setChecked(d.show_quota_used)
+        self.show_meeting.setChecked(d.show_meeting_aic)
+        self.save_dir.clear()
+        self._update_dirty()
+
+    def _sync_overlay_options(self) -> None:
+        """悬浮框关掉时，里面显示什么就没意义了。"""
+        on = self.show_overlay.isChecked()
+        for w in self._overlay_option_boxes:
+            w.setEnabled(on)
 
     def _sync_engine_enabled(self) -> None:
         self.engine.setEnabled(self.direction.currentData() == lang.JA_ZH)
@@ -1026,23 +1531,146 @@ class SettingsDialog(QDialog):
         if d:
             self.save_dir.setText(str(Path(d)))
 
+    def _reload_profiles(self, select: str | None = None) -> None:
+        # 重建期间屏蔽信号：否则 clear() 会先报一次「没有端点」，模型列表白刷一遍。
+        self.profile_combo.blockSignals(True)
+        try:
+            self.profile_combo.clear()
+            for p in self.profiles:
+                self.profile_combo.addItem(p.get("name", ""), p.get("name", ""))
+            target = select or (self.profiles[0].get("name", "") if self.profiles else "")
+            idx = self.profile_combo.findData(target)
+        finally:
+            self.profile_combo.blockSignals(False)
+        if idx >= 0:
+            self.profile_combo.setCurrentIndex(idx)
+        else:
+            self._request_refresh()
+
+    def _new_profile(self) -> None:
+        dlg = ProfileDialog(None, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        p = dlg.result_profile()
+        names = {x.get("name") for x in self.profiles}
+        if p["name"] in names:
+            QMessageBox.warning(self, "模型服务", "已存在同名端点，请换一个名字。")
+            return
+        self.profiles.append(p)
+        self.provider.setCurrentIndex(self.provider.findData("openai"))
+        self._reload_profiles(p["name"])
+        self._update_dirty()
+
+    def _edit_profile(self) -> None:
+        name = self.profile_combo.currentData()
+        for i, p in enumerate(self.profiles):
+            if p.get("name") == name:
+                dlg = ProfileDialog(p, self)
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    return
+                self.profiles[i] = dlg.result_profile()
+                self._reload_profiles(self.profiles[i]["name"])
+                self._update_dirty()
+                return
+
+    def _delete_profile(self) -> None:
+        name = self.profile_combo.currentData()
+        if not name:
+            return
+        if QMessageBox.question(self, "模型服务", f"删除端点「{name}」？") != QMessageBox.StandardButton.Yes:
+            return
+        self.profiles = [p for p in self.profiles if p.get("name") != name]
+        self._reload_profiles()
+        self._update_dirty()
+
+    def _sync_provider(self) -> None:
+        self.set_service_error("")
+        custom = self.provider.currentData() == "openai"
+        switched = getattr(self, "_synced_provider", None) not in (None, self.provider.currentData())
+        self._synced_provider = self.provider.currentData()
+        if switched:
+            # 换服务商时先清空模型名：Copilot 的模型名带进端点会直接 400，反之亦然。
+            self.set_models([])
+        for w in (self.profile_combo, self.btn_profile_new, self.btn_profile_edit, self.btn_profile_del):
+            w.setEnabled(custom)
+        # 自定义端点也要能选模型：以前这里把它禁用了，恰恰是唯一能选模型的地方。
+        self.model.setEnabled(True)
+        self.model.setEditable(custom)
+        self.effort.setEnabled(True)
+        self.provider_note.setText(
+            "自定义端点：模型从该端点的 /models 拉取，选中的名字会存进端点配置；"
+            "推理强度按模型支持的档位发送（none 表示关闭思考，需端点支持）；用量按 token 记。"
+            if custom
+            else ""
+        )
+        self._sync_effort_choices()
+        self._request_refresh()
+
     def set_models(self, models: list[ModelOption]) -> None:
-        current = self.model.currentData() or self.s.model
+        current = self.model.currentData() or self._desired_model()
         self._models = models
         ordered, best = sorted_models(models)
+        self.model.blockSignals(True)
         self.model.clear()
         for o in ordered:
             self.model.addItem(model_label(o, models, best), o.id)
             self.model.setItemData(self.model.count() - 1, model_tooltip(o), Qt.ItemDataRole.ToolTipRole)
-        if self.model.findData(current) < 0:
-            self.model.addItem(current, current)
-        self._select(self.model, current)
+        if current and models and self.model.findData(current) < 0:
+            self.model.addItem(current, current)  # 保留已保存但不在列表里的模型名；空列表不保留，免得带错服务商
+        if current:
+            self._select(self.model, current)
+        elif self.model.count():
+            # 可编辑的下拉框加完条目不会自动选中，空模型名就永远填不上。
+            self.model.setCurrentIndex(0)
+        self.model.blockSignals(False)
         self.model_info.setText(
             "<small>成本按本机历史会议估算（无历史时按每小时 600 句估算）；"
             "延迟：「平均」为本机实测，「约」为内置参考值。</small>"
             if models
             else "<small>正在获取模型列表…</small>"
         )
+        # 端点没填模型名时，把拉到的第一项定下来，并算作初始状态而不是「已修改」。
+        if self.provider.currentData() == "openai" and not (self.current_profile() or {}).get("model"):
+            self._stash_model()
+            if hasattr(self, "_baseline"):
+                self._baseline["model"] = self._getters["model"]()
+                self._update_dirty()
+        if hasattr(self, "effort"):
+            self._sync_effort_choices()
+
+    def _sync_effort_choices(self, *_args) -> None:
+        """端点声明了推理档位时，只展示它支持的档位（保留旧值并提示回退）。"""
+        if not hasattr(self, "effort"):
+            return
+        current = self.effort.currentText()
+        opt = None
+        if self.provider.currentData() == "openai":
+            mid = self.model.currentData() or self.model.currentText().strip()
+            opt = next((o for o in self._models if o.id == mid), None)
+        values = (
+            effort_choices(opt)
+            if opt is not None and (opt.efforts or opt.can_disable_thinking)
+            else list(EFFORTS)
+        )
+        if current and current not in values:
+            values.append(current)  # 旧配置值保留在列表里，交给后端 clamp，避免静默改设置。
+        if [self.effort.itemText(i) for i in range(self.effort.count())] != values:
+            self.effort.blockSignals(True)
+            try:
+                self.effort.clear()
+                self.effort.addItems(values)
+                self.effort.setCurrentText(current)
+            finally:
+                self.effort.blockSignals(False)
+        tip = ""
+        if opt is not None and opt.efforts:
+            supported = " / ".join(effort_choices(opt))
+            tip = f"该模型支持：{supported}"
+            if opt.default_effort:
+                tip += f"（默认 {opt.default_effort}）"
+            if current and current not in effort_choices(opt):
+                tip += f"\n当前选择 {current} 不在支持列表，发送时会自动回退。"
+        self.effort.setToolTip(tip)
 
     def _refresh(self) -> None:
         if self._on_refresh:
@@ -1075,6 +1703,10 @@ class SettingsDialog(QDialog):
         s.asr_correct = self.asr_correct.isChecked()
         if not self._meeting_active:
             s.direction = self.direction.currentData()
+        s.provider = self.provider.currentData()
+        self._stash_model()
+        s.profiles = [dict(p) for p in self.profiles]
+        s.active_profile = self.profile_combo.currentData() or ""
         s.model = self.model.currentData() or s.model
         s.reasoning_effort = self.effort.currentText()
         s.session_rotate_minutes = self.rotate.value()
@@ -1085,6 +1717,8 @@ class SettingsDialog(QDialog):
         s.fillers_zh = [f.strip() for f in re.split(r"[、,，\s]+", self.fillers_zh.text()) if f.strip()]
         s.font_size = self.font.value()
         s.opacity = self.opacity.value()
+        s.show_overlay = self.show_overlay.isChecked()
+        s.subtitle_mode = self.subtitle_mode.isChecked()
         s.hotkey = self.hotkey.text().strip() or s.hotkey
         s.selection_hotkey = self.selection_hotkey.text().strip() or s.selection_hotkey
         s.selection_chinese_px = self.chinese_size.value()
@@ -1104,6 +1738,7 @@ class SettingsDialog(QDialog):
 class LoginDialog(QDialog):
     token_submitted = Signal(str)
     recheck_requested = Signal()
+    use_custom_requested = Signal()
 
     def __init__(self, message: str, parent=None) -> None:
         super().__init__(parent)
@@ -1138,8 +1773,21 @@ class LoginDialog(QDialog):
         row.addWidget(self.token, 1)
         row.addWidget(btn_token)
         lay.addLayout(row)
+        lay.addWidget(
+            QLabel(
+                "<b>方式三：使用自己的模型服务</b><br>"
+                "<small>OpenAI 兼容端点（DeepSeek / Kimi / Ollama / 公司网关…），不需要 Copilot 订阅。</small>"
+            )
+        )
+        btn_custom = QPushButton("改用自己的 API")
+        btn_custom.clicked.connect(self._choose_custom)
+        lay.addWidget(btn_custom)
         self.info = QLabel("")
         lay.addWidget(self.info)
+
+    def _choose_custom(self) -> None:
+        self.use_custom_requested.emit()
+        self.accept()
 
     def _run_cli_login(self) -> None:
         subprocess.Popen(["cmd", "/k", "copilot login"], creationflags=subprocess.CREATE_NEW_CONSOLE)
