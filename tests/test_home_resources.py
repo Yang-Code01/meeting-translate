@@ -35,3 +35,41 @@ def test_profile_dialog_has_test_button() -> None:
     assert dialog.btn_test.text() == "测试连接"
     assert dialog.btn_test.isEnabled()
     dialog.deleteLater()
+
+
+def test_model_card_asks_for_runtime_before_models(monkeypatch, tmp_path) -> None:
+    """模型装了也跑不起来时，卡片要先要运行时而不是先要那 1.1GB。"""
+    from meeting_translate import app as app_module
+    from meeting_translate import tts_runtime
+    from meeting_translate.tts_models import ModelManager
+
+    calls: list[tuple[str, dict]] = []
+
+    class _Home:
+        def set_model_state(self, status: str, **kwargs) -> None:
+            calls.append((status, kwargs))
+
+        def set_cable_state(self, *_args, **_kwargs) -> None:
+            pass
+
+        def set_teams_state(self, *_args, **_kwargs) -> None:
+            pass
+
+    class _Devices:
+        complete = True
+        missing: list[str] = []
+
+    app = app_module.App.__new__(app_module.App)
+    app.home = _Home()
+    app.model_manager = ModelManager(tmp_path / "tts")
+    monkeypatch.setattr(app_module.duplex_audio, "detect_cable_devices", lambda: _Devices())
+
+    monkeypatch.setattr(tts_runtime, "is_ready", lambda: False)
+    app_module.App._refresh_resources(app)
+    assert calls[-1][0].startswith("缺语音运行时")
+    assert calls[-1][1]["primary"] == "安装运行时"
+
+    monkeypatch.setattr(tts_runtime, "is_ready", lambda: True)
+    app_module.App._refresh_resources(app)
+    assert calls[-1][0].startswith("未安装 · 约")
+    assert calls[-1][1]["primary"] == "下载"
