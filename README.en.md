@@ -4,12 +4,13 @@
 
 [![CI](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml/badge.svg)](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml)
 
-A small Windows desktop tool with two features:
+A small Windows desktop tool with three features:
 
 - **Live meeting translation** — it listens to **any meeting app** (the system loopback is treated as *them*, your microphone as *you*), runs speech recognition locally, translates with GitHub Copilot or your own OpenAI-compatible endpoint, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
 - **Selection translation** — select a piece of Japanese text in any application and press **Alt+M**: a popup next to the cursor shows the Chinese translation and the original annotated with furigana. It runs on a separate, pre-warmed session, so it never interrupts a meeting.
+- **Voice interpretation** (Beta) — two-way speech: you speak Chinese and the other side hears Japanese in the meeting; they speak Japanese and you hear Chinese in your headphones. Recognition and synthesis run locally, with audio routed through VB-Audio virtual cables.
 
-No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no virtual audio cable, and speech recognition runs entirely on your CPU — only text is sent to Copilot.
+No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work). The first two features need no virtual audio cable, and speech recognition runs entirely on your CPU — only text is sent to Copilot.
 
 ## Requirements
 
@@ -19,6 +20,7 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no
 | Account | A GitHub Copilot subscription, or an API key for any OpenAI-compatible service (it performs translation and summarization) |
 | Hardware | Any x86-64 CPU; no discrete GPU. Recognition uses 4 threads by default |
 | Microphone | Optional. When enabled your own speech is tagged as *you*; headphones recommended |
+| Voice interpretation | Additionally needs VB-Audio virtual cables (CABLE A+B and Hi-Fi Cable; the app helps you download them), Python 3.12, and ~1.1 GB of speech models |
 
 ## Installation
 
@@ -29,6 +31,15 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work), no
 3. Log in to Copilot on first use — see [Sign in](#sign-in-to-copilot) — or enter your own API key in Settings.
 
 Nothing is written to the registry and no admin rights are needed. Uninstalling means deleting the exe and `%APPDATA%\meeting-translate\`.
+
+To use **voice interpretation** you need a one-time setup (all three steps live on the resource cards of the home screen; each card's 「详细」 button has the full story):
+
+1. **Speech runtime** — click 「安装运行时」. The app creates a separate environment with the Python 3.12 on your machine
+   and installs Style-Bert-VITS2 into it (it needs `numpy<2`, which cannot live inside the main app; ~400 MB).
+   If no Python 3.12 is found, it offers a download link.
+2. **Speech models** — click 「下载」 to fetch MeloTTS, Style-Bert-VITS2 and the Japanese BERT, ~1.1 GB.
+3. **Virtual cables** — click 「下载安装」 to install VB-Audio CABLE and Hi-Fi Cable, then set your meeting app's
+   speaker to `CABLE Input` and microphone to `Hi-Fi Cable Output` (the app has step-by-step guidance, using Teams as an example).
 
 ### Option 2: Run from source
 
@@ -101,7 +112,20 @@ Select a piece of Japanese text in **any application** and press **Alt+M** (conf
 
 > How it works: the hotkey triggers an emulated Ctrl+C to read the current selection, then restores your previous clipboard. So **select the text first, then press the hotkey**.
 
-### Sentence splitting and fillers
+### Voice interpretation (two-way)
+
+You speak Chinese and the other side hears Japanese; they speak Japanese and you hear Chinese. Two virtual cable endpoints make both happen at once:
+
+```
+you ──mic──▶ recognize Chinese ──translate──▶ Japanese TTS ──▶ [CABLE-B Input] ══▶ meeting app mic [CABLE-B Output] ──▶ them
+them ──▶ meeting app speaker [CABLE-A Input] ══▶ loopback capture ──recognize Japanese──translate──▶ Chinese TTS ──▶ your headphones
+```
+
+- Run 「自检」 (self-check) and 「试听日语」 (preview Japanese) from the overlay the first time, to confirm all four endpoints work and that your headphones and the virtual cable are not swapped.
+- **Turn off noise suppression and echo cancellation** in your meeting app, otherwise the Japanese arriving through the virtual cable is treated as noise and cut.
+- Chinese TTS (MeloTTS) plays locally and returns immediately; Japanese TTS (Style-Bert-VITS2) synthesizes in a separate process and needs ~15 s to load for the first sentence, then 0.5–1 s per sentence. It is pre-warmed in the background when you start interpretation.
+- Sizes, locations and what every file does: 「详细」 on the 「语音模型」 card.
+
 
 - **Splitting** — 0.6 s of silence ends a segment. If the segment ends in て/が/けど/ので, or is only 1–3 characters, it is treated as unfinished and held for continuation (Chinese uses 的/和/但是/因为 etc.). It waits at most 3 s, flushes anyway after 20 s of merging, and force-splits single segments longer than 10 s. All three are configurable.
 - **Fillers** — standalone え/あ/えー/えーと/あの/うん/ん are shown but not translated; the Chinese list is maintained separately. Both lists are editable.
