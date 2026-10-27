@@ -6,12 +6,15 @@ import html
 import re
 import shutil
 import subprocess
+import threading
 import urllib.request
+
+import httpx
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +25,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFontComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -34,6 +38,7 @@ from PySide6.QtWidgets import (
     QSizeGrip,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -75,11 +80,11 @@ def effort_choices(opt: ModelOption | None) -> list[str]:
 
 SPEAKER_COLORS = {audio.THEM: "#7fd1ff", audio.ME: "#ffd27f"}
 BUTTON_STYLE = (
-    "QPushButton{color:#eee;background:rgba(255,255,255,30);border:none;padding:2px 8px;border-radius:4px}"
+    "QPushButton{color:#eee;background:rgba(255,255,255,30);border:none;padding:5px 11px;border-radius:4px}"
     "QPushButton:hover{background:rgba(255,255,255,70)}QPushButton:disabled{color:#777}"
 )
 MIC_ON_STYLE = (
-    "QPushButton{color:white;background:rgba(46,160,67,200);border:none;padding:2px 8px;border-radius:4px}"
+    "QPushButton{color:white;background:rgba(46,160,67,200);border:none;padding:5px 11px;border-radius:4px}"
     "QPushButton:hover{background:rgba(46,160,67,255)}"
 )
 DIALOG_GAP = 8
@@ -240,17 +245,24 @@ class CornerGrip(QWidget):
 class Overlay(QWidget):
     toggle_clicked = Signal()
     stop_clicked = Signal()
+    home_clicked = Signal()
     settings_clicked = Signal()
     mic_toggled = Signal(bool)
     retry_clicked = Signal()
     geometry_changed = Signal(list)
+    zh_ja_toggled = Signal(bool)
+    ja_zh_toggled = Signal(bool)
+    preview_ja_clicked = Signal()
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("会议翻译")
         self._opacity = settings.opacity
+        self._src_size = settings.source_font_size
+        self._src_color = settings.source_font_color or "#ffffff"
         self._font_size = settings.font_size
+        self._font_color = settings.font_color or "#ffffff"
         self._subtitle_mode = settings.subtitle_mode
         self._drag: QPoint | None = None
         self._fullscreen = False
@@ -267,27 +279,81 @@ class Overlay(QWidget):
         self.btn_mic.setCheckable(True)
         self.btn_toggle = QPushButton("▶ 开始")
         self.btn_stop = QPushButton("■ 结束")
+        self.btn_home = QPushButton("主界面")
+        self.btn_home.setToolTip("返回主页面，并把悬浮框最小化")
         self.btn_settings = QPushButton("⚙")
         self.btn_hide = QPushButton("—")
+        self.chk_zh_ja = QCheckBox("中转日")
+        self.chk_zh_ja.setToolTip("开启：我的中文→日语 TTS 给对方；关闭：麦克风原声直接送到对方")
+        self.chk_ja_zh = QCheckBox("日转中")
+        self.chk_ja_zh.setToolTip("开启：对方日语→中文 TTS 给我；关闭：对方原声直接送到我的耳机")
+        self.btn_preview_ja = QPushButton("试听日语")
+        self.btn_preview_ja.setToolTip("把最近一次「中转日」生成的日语播到本机耳机，用来随时检查效果（不会发给对方）")
+        for chk in (self.chk_zh_ja, self.chk_ja_zh):
+            chk.setStyleSheet("QCheckBox{color:#ddd;font-size:12px;spacing:4px;} QCheckBox::indicator{width:14px;height:14px;}")
         self.btn_stop.setEnabled(False)
         for w in (self.status, self.latency, self.usage):
             w.setStyleSheet("color:#ddd;")
-        for b in (self.btn_mic, self.btn_toggle, self.btn_stop, self.btn_settings, self.btn_hide):
+        for b in (
+            self.btn_mic,
+            self.btn_toggle,
+            self.btn_stop,
+            self.btn_home,
+            self.btn_settings,
+            self.btn_hide,
+            self.btn_preview_ja,
+        ):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setStyleSheet(BUTTON_STYLE)
+        for chk in (self.chk_zh_ja, self.chk_ja_zh):
+            chk.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.set_mic(settings.mic_enabled)
         self.btn_mic.toggled.connect(self._on_mic_toggled)
         self.btn_toggle.clicked.connect(self.toggle_clicked)
         self.btn_stop.clicked.connect(self.stop_clicked)
+        self.btn_home.clicked.connect(self.home_clicked)
         self.btn_settings.clicked.connect(self.settings_clicked)
         self.btn_hide.clicked.connect(self.hide)
+        self.chk_zh_ja.toggled.connect(self.zh_ja_toggled.emit)
+        self.chk_ja_zh.toggled.connect(self.ja_zh_toggled.emit)
+        self.btn_preview_ja.clicked.connect(self.preview_ja_clicked)
 
         bar = QHBoxLayout()
         bar.addWidget(self.status, 1)
         bar.addWidget(self.latency)
         bar.addWidget(self.usage)
-        for b in (self.btn_mic, self.btn_toggle, self.btn_stop, self.btn_settings, self.btn_hide):
+        for b in (
+            self.btn_mic,
+            self.btn_toggle,
+            self.btn_stop,
+            self.btn_home,
+            self.btn_settings,
+            self.btn_hide,
+        ):
             bar.addWidget(b)
+
+        self.duplex_bar = QWidget()
+        drow = QHBoxLayout(self.duplex_bar)
+        drow.setContentsMargins(2, 0, 2, 0)
+        drow.setSpacing(7)
+        drow.addWidget(self.chk_zh_ja)
+        drow.addWidget(self.chk_ja_zh)
+        drow.addWidget(self.btn_preview_ja)
+        drow.addStretch(1)
+        self.duplex_bar.hide()
+
+        self.duplex_remote_now = ElidedLabel("")
+        self.duplex_local_now = ElidedLabel("")
+        for label in (self.duplex_remote_now, self.duplex_local_now):
+            label.setStyleSheet("color:#9fc3e8;font-size:11px;")
+        self.duplex_now_box = QWidget()
+        nrow = QVBoxLayout(self.duplex_now_box)
+        nrow.setContentsMargins(2, 0, 2, 0)
+        nrow.setSpacing(1)
+        nrow.addWidget(self.duplex_remote_now)
+        nrow.addWidget(self.duplex_local_now)
+        self.duplex_now_box.hide()
 
         self.progress = QFrame()
         self.progress.setStyleSheet(
@@ -331,6 +397,8 @@ class Overlay(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 6, 6, 2)
         lay.addLayout(bar)
+        lay.addWidget(self.duplex_bar)
+        lay.addWidget(self.duplex_now_box)
         lay.addWidget(self.progress)
         lay.addWidget(self.view, 1)
 
@@ -357,9 +425,14 @@ class Overlay(QWidget):
 
     def apply_style(self, settings: Settings) -> None:
         self._opacity = settings.opacity
+        self._src_size = settings.source_font_size
+        self._src_color = settings.source_font_color or "#ffffff"
         self._font_size = settings.font_size
+        self._font_color = settings.font_color or "#ffffff"
         self._subtitle_mode = settings.subtitle_mode
-        self.view.setFont(QFont("Microsoft YaHei UI", settings.font_size))
+        # 基础字体跟随译文；原文/译文的实际大小与颜色由 HTML span 各自指定
+        self.view.setFont(QFont(settings.font_family or "Microsoft YaHei UI", settings.font_size))
+        self.view.setStyleSheet(f"background:transparent;color:{self._font_color};")
         self.update()
         self.render()
 
@@ -452,6 +525,46 @@ class Overlay(QWidget):
         """running: 正在采集；active: 有进行中的会议（含暂停）。"""
         self.btn_toggle.setText("⏸ 暂停" if running else ("▶ 继续" if active else "▶ 开始"))
         self.btn_stop.setEnabled(active)
+        # 会议进行中（含暂停）不允许从悬浮框回主界面；否则会在后台继续采集，
+        # 主界面还会因为“正在会话”拒绝切换入口。只能先结束会议。
+        self.btn_home.setEnabled(not active)
+        self.btn_home.setToolTip(
+            "翻译进行中，请先结束会议再回主界面"
+            if active
+            else "返回主页面，并把悬浮框最小化"
+        )
+
+    def set_duplex(self, enabled: bool, zh_ja: bool = True, ja_zh: bool = True) -> None:
+        """显示/隐藏双向同传开关，并同步当前状态。"""
+        self.chk_zh_ja.blockSignals(True)
+        self.chk_ja_zh.blockSignals(True)
+        self.chk_zh_ja.setChecked(bool(zh_ja))
+        self.chk_ja_zh.setChecked(bool(ja_zh))
+        self.chk_zh_ja.blockSignals(False)
+        self.chk_ja_zh.blockSignals(False)
+        self.duplex_bar.setVisible(bool(enabled))
+        self.duplex_now_box.setVisible(bool(enabled))
+        if not enabled:
+            self.duplex_remote_now.setText("")
+            self.duplex_local_now.setText("")
+
+    def set_duplex_play(self, direction: str, text: str, state: str) -> None:
+        """显示对方/本机实际开始播放的句子；state=start|done|direct|clear。"""
+        remote = direction == lang.ZH_JA
+        label = self.duplex_remote_now if remote else self.duplex_local_now
+        who = "对方" if remote else "你"
+        if state == "direct":
+            label.setText(f"{who}听到：原声直通")
+            label.setToolTip("当前方向未开启翻译，正在直接输出原始音频")
+        elif state == "clear":
+            label.setText("")
+            label.setToolTip("")
+        elif state == "done":
+            label.setText(f"{who}刚听完：{text}")
+            label.setToolTip(text)
+        elif state == "start":
+            label.setText(f"{who}听到：{text}")
+            label.setToolTip(text)
 
     def set_usage(self, text: str, warn: bool) -> None:
         self.usage.setText(text)
@@ -517,7 +630,8 @@ class Overlay(QWidget):
         self.render()
 
     def render(self) -> None:
-        ja_size = max(9, int(self._font_size * 0.75))
+        src_style = f"color:{self._src_color};font-size:{self._src_size}pt"
+        zh_style = f"color:{self._font_color};font-size:{self._font_size}pt"
         rows = []
         if self._subtitle_mode:
             # 视频字幕：只保留已有译文，不显示原文、说话方标签和未完成的识别片段。
@@ -526,25 +640,23 @@ class Overlay(QWidget):
                 if text:
                     rows.append(
                         f"<div style='margin-bottom:6px'>"
-                        f"<span style='font-size:{self._font_size}pt'>{html.escape(text)}</span></div>"
+                        f"<span style='{zh_style}'>{html.escape(text)}</span></div>"
                     )
         else:
             for e in self.entries[-MAX_VISIBLE_ENTRIES:]:
-                color = SPEAKER_COLORS.get(e.source, "#ccc")
-                ja = f"<span style='color:{color};font-size:{ja_size}pt'>【{e.source}】{html.escape(e.ja)}</span>"
+                ja = f"<span style='{src_style}'>【{e.source}】{html.escape(e.ja)}</span>"
                 if e.zh == "":  # 语气词：只显示不翻译
                     rows.append(f"<div style='margin-bottom:6px'>{ja}</div>")
                     continue
                 zh = html.escape(e.zh) if e.zh else "<span style='color:#888'>…</span>"
                 rows.append(
                     f"<div style='margin-bottom:6px'>{ja}<br>"
-                    f"<span style='font-size:{self._font_size}pt'>{zh}</span></div>"
+                    f"<span style='{zh_style}'>{zh}</span></div>"
                 )
             for src, text in self.partials.items():
                 if text:
-                    color = SPEAKER_COLORS.get(src, "#ccc")
                     rows.append(
-                        f"<div style='color:{color};font-size:{ja_size}pt'><i>【{src}】{html.escape(text)} …</i></div>"
+                        f"<div style='{src_style}'><i>【{src}】{html.escape(text)} …</i></div>"
                     )
         self.view.setHtml("".join(rows))
         sb = self.view.verticalScrollBar()
@@ -571,7 +683,18 @@ class RubyLabel(QWidget):
         self.configure(10, 10, "#ffe082", "#dddddd", True)
         self.hide()
 
-    def configure(self, kana_px: int, kanji_px: int, kana_color: str, kanji_color: str, show_kanji: bool) -> None:
+    def configure(
+        self,
+        kana_px: int,
+        kanji_px: int,
+        kana_color: str,
+        kanji_color: str,
+        show_kanji: bool,
+        family: str = "",
+    ) -> None:
+        if family:
+            self._ruby_font.setFamily(family)
+            self._base_font.setFamily(family)
         self._ruby_font.setPixelSize(kana_px)
         self._ruby_font.setWeight(QFont.Weight.Bold)
         self._base_font.setPixelSize(kanji_px)
@@ -805,12 +928,18 @@ class SelectionResultPopup(QWidget):
         self.chinese.setStyleSheet(
             f"color:{settings.selection_chinese_color};font-size:{settings.selection_chinese_px}px"
         )
+        family = settings.selection_font_family or "Microsoft YaHei UI"
+        for label in (self.message, self.chinese, self.reading_title, self._title):
+            font = label.font()
+            font.setFamily(family)
+            label.setFont(font)
         self.hiragana.configure(
             settings.selection_kana_px,
             settings.selection_kanji_px,
             settings.selection_kana_color,
             settings.selection_kanji_color,
             settings.selection_show_kanji,
+            family,
         )
         size = settings.selection_popup_size
         self._saved_size = QSize(size[0], size[1]) if len(size) == 2 else None
@@ -940,6 +1069,8 @@ def model_tooltip(o: ModelOption) -> str:
 class ProfileDialog(QDialog):
     """编辑一条自定义端点（OpenAI 兼容）。key 只在提交时加密。"""
 
+    test_done = Signal(bool, str)
+
     def __init__(self, profile: dict | None = None, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("模型服务")
@@ -975,6 +1106,16 @@ class ProfileDialog(QDialog):
             QLabel("<small>单价用于折算「本场花费」，可留 0 表示不折算。key 用 Windows DPAPI 加密后存进 config.json。</small>")
         )
 
+        self.btn_test = QPushButton("测试连接")
+        self.test_status = QLabel("")
+        self.test_status.setStyleSheet("color:#888")
+        row = QHBoxLayout()
+        row.addWidget(self.btn_test)
+        row.addWidget(self.test_status, 1)
+        form.addRow("", row)
+        self.btn_test.clicked.connect(self._test)
+        self.test_done.connect(self._on_test_done)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._ok)
         buttons.rejected.connect(self.reject)
@@ -990,6 +1131,52 @@ class ProfileDialog(QDialog):
         box.setSpecialValueText("不折算")
         box.setValue(float(value) if value else 0.0)
         return box
+
+    def _test(self) -> None:
+        base_url = normalize_base_url(self.base_url.text())
+        if not base_url.startswith(("http://", "https://")):
+            self.test_status.setText("接口地址要以 http:// 或 https:// 开头")
+            return
+        key = self.api_key.text().strip()
+        if not key:
+            try:
+                key = secrets.unprotect(self._existing.get("api_key", ""))
+            except Exception:
+                key = ""
+        if not key:
+            self.test_status.setText("请填写 API key")
+            return
+        self.btn_test.setEnabled(False)
+        self.test_status.setStyleSheet("color:#888")
+        self.test_status.setText("测试中…")
+        url = base_url.rstrip("/") + "/models"
+        verify = not self.verify.isChecked()
+
+        def work() -> None:
+            try:
+                response = httpx.get(
+                    url,
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=20,
+                    verify=verify,
+                    follow_redirects=True,
+                )
+                if response.status_code >= 400:
+                    self.test_done.emit(False, f"HTTP {response.status_code}：{response.text[:120]}")
+                    return
+                data = response.json()
+                items = data.get("data") if isinstance(data, dict) else None
+                count = len(items) if isinstance(items, list) else 0
+                self.test_done.emit(True, f"连接成功，返回 {count} 个模型")
+            except Exception as e:  # noqa: BLE001
+                self.test_done.emit(False, f"连接失败：{e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_test_done(self, ok: bool, message: str) -> None:
+        self.btn_test.setEnabled(True)
+        self.test_status.setStyleSheet("color:#3fb950" if ok else "color:#e06c75")
+        self.test_status.setText(message)
 
     def _ok(self) -> None:
         base_url = normalize_base_url(self.base_url.text())
@@ -1020,7 +1207,127 @@ class ProfileDialog(QDialog):
         return p
 
 
+class _PaintedArrow:
+    """在控件右边缘自己画箭头。
+
+    深色主题下 QSS 画不出三角形（`border-*` 拼出来就是一块灰方），
+    系统默认箭头又呈深灰色、压在深底上几乎看不见，因此改成自绘。
+    """
+
+    # (纵向位置比例, 尖端朝向)：-1 朝上、+1 朝下
+    _arrow_marks: tuple[tuple[float, int], ...] = ((0.5, 1),)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#7d8698"), 1.3))
+        x = self.width() - 13.0
+        for frac, tip in self._arrow_marks:
+            y = self.height() * frac
+            apex = QPointF(x, y + tip * 2.2)
+            painter.drawLine(QPointF(x - 3.6, y - tip * 2.2), apex)
+            painter.drawLine(apex, QPointF(x + 3.6, y - tip * 2.2))
+        painter.end()
+
+
+class ChevronCombo(_PaintedArrow, QComboBox):
+    """带自绘箭头的下拉框。"""
+
+
+class ChevronFontCombo(_PaintedArrow, QFontComboBox):
+    """带自绘箭头的字体下拉框。"""
+
+
+class ChevronSpin(_PaintedArrow, QSpinBox):
+    """带自绘上下箭头的整数框。"""
+
+    _arrow_marks = ((0.30, -1), (0.72, 1))
+
+
+class ChevronDoubleSpin(_PaintedArrow, QDoubleSpinBox):
+    """带自绘上下箭头的小数框。"""
+
+    _arrow_marks = ((0.30, -1), (0.72, 1))
+
+
+# 设置窗口的深色外观：与首页（HOME_QSS）、详细窗（DETAIL_QSS）同一套配色。
+SETTINGS_QSS = """
+QDialog { background: #0f1115; }
+QLabel { color: #c3cbdb; font-size: 12px; }
+QLabel#dialogTitle { color: #f4f6fb; font-size: 22px; font-weight: 800; }
+QLabel#dialogSubtitle { color: #8991a4; font-size: 12px; }
+QLabel#cardTitle { color: #f4f6fb; font-size: 14px; font-weight: 700; }
+QLabel#cardDesc { color: #8991a4; font-size: 12px; }
+QLabel#dirtyHint { color: #e0a458; font-size: 12px; }
+QWidget#navColumn { background: #0b0d12; border-right: 1px solid #1c212b; }
+QWidget#dialogFooter { background: #0b0d12; border-top: 1px solid #1c212b; }
+QFrame#card { background: #171a21; border: 1px solid #272d3a; border-radius: 12px; }
+QPushButton#navItem {
+    text-align: left; padding: 8px 12px; border: 1px solid transparent;
+    border-radius: 8px; background: transparent; color: #8991a4; font-size: 13px;
+}
+QPushButton#navItem:hover { background: #151922; color: #d7deea; }
+QPushButton#navItem:checked {
+    background: #171a21; color: #f4f6fb; border: 1px solid #272d3a; border-left: 2px solid #4f7cff;
+}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QFontComboBox {
+    background: #12151c; border: 1px solid #2a3040; border-radius: 8px;
+    color: #e7ecf5; padding: 5px 8px; selection-background-color: #4f7cff;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QFontComboBox:focus {
+    border-color: #4f7cff;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QFontComboBox:disabled {
+    color: #5b6478; background: #141821; border-color: #232936;
+}
+QComboBox::drop-down, QFontComboBox::drop-down { border: 0; width: 20px; }
+QComboBox::down-arrow, QFontComboBox::down-arrow { image: none; }
+QComboBox QAbstractItemView {
+    background: #171a21; border: 1px solid #2a3040; color: #e7ecf5;
+    selection-background-color: #2b3a5c; outline: 0;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border; subcontrol-position: top right; width: 16px;
+    border-left: 1px solid #2a3040; background: #1a1f2a; border-top-right-radius: 8px;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border; subcontrol-position: bottom right; width: 16px;
+    border-left: 1px solid #2a3040; background: #1a1f2a; border-bottom-right-radius: 8px;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow,
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: none; }
+QCheckBox { color: #c3cbdb; spacing: 8px; }
+QCheckBox::indicator {
+    width: 15px; height: 15px; border: 1px solid #3a4356; border-radius: 4px; background: #12151c;
+}
+QCheckBox::indicator:hover { border-color: #4f7cff; }
+QCheckBox::indicator:checked { background: #4f7cff; border-color: #4f7cff; }
+QCheckBox:disabled { color: #5b6478; }
+QPushButton {
+    background: #202635; border: 1px solid #313a4f; border-radius: 8px;
+    color: #d7deea; padding: 6px 14px; font-size: 12px;
+}
+QPushButton:hover { background: #273044; }
+QPushButton:disabled { color: #5b6478; background: #171b24; border-color: #232936; }
+QPushButton#primary { background: #4f7cff; border: 1px solid #4f7cff; color: #ffffff; font-weight: 600; }
+QPushButton#primary:hover { background: #6289ff; }
+QPushButton#danger { background: transparent; border: 1px solid #3a2a2e; color: #d9534f; }
+QPushButton#danger:hover { background: #2a1a1e; }
+QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 2px; }
+QScrollBar::handle:vertical { background: #2b3344; border-radius: 4px; min-height: 28px; }
+QScrollBar::handle:vertical:hover { background: #3a4457; }
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {
+    background: transparent; height: 0; width: 0;
+}
+QToolTip { background: #171a21; color: #e7ecf5; border: 1px solid #2a3040; padding: 4px; }
+"""
+
+
 class SettingsDialog(QDialog):
+    quit_requested = Signal()
+
     def __init__(
         self,
         settings: Settings,
@@ -1036,53 +1343,76 @@ class SettingsDialog(QDialog):
         self.s = settings
         self._on_refresh = on_refresh
         self._on_bench = on_bench
-        form = QFormLayout()
-        # 长行换行会把字段顶到第一列，和上下行对不齐；宁可让下拉框省略文字。
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        # 六个分区各一张表单，放进右侧的分区页面里；导航只决定哪一页可见。
+        form_dev = self._form()
+        form_tr = self._form()
+        form_seg = self._form()
+        form_ov = self._form()
+        form_sel = self._form()
+        form_data = self._form()
 
-        # 启动失败等严重错误显示在表单最上方：不用滚动就能看到。
+        # 启动失败等严重错误挂在标题下面：不切分区也能看到。
         self.service_error = QLabel("")
         self.service_error.setWordWrap(True)
         self.service_error.setStyleSheet("color:#e06c75")
         self.service_error.hide()
-        form.addRow(self.service_error)
 
-        self.speaker = flexible_combo(QComboBox())
+        self.speaker = flexible_combo(ChevronCombo())
         self.speaker.addItem("系统默认", None)
         for n in audio.list_speakers():
             self.speaker.addItem(n, n)
         self._select(self.speaker, settings.loopback_device)
 
-        self.mic = flexible_combo(QComboBox())
+        self.capture_speaker = flexible_combo(ChevronCombo())
+        self.capture_speaker.addItem("自动识别 CABLE-A", None)
+        for n in audio.list_speakers():
+            self.capture_speaker.addItem(n, n)
+        self.capture_speaker.setToolTip(
+            "会议软件把对方声音输出到哪个虚拟扬声器，这里就选哪个。"
+            "如果你在会议软件里选了 CABLE In 16ch，这里也要选它，不能只选 CABLE Input。"
+        )
+        self._select(self.capture_speaker, settings.duplex_capture_device)
+
+        self.local_speaker = flexible_combo(ChevronCombo())
+        self.local_speaker.addItem("自动（优先耳机/扬声器）", None)
+        for n in audio.list_speakers():
+            self.local_speaker.addItem(n, n)
+        self.local_speaker.setToolTip(
+            "双向同传时，中文 TTS 播放到哪个设备。不要把这里选成 CABLE/Hi-Fi，否则耳机听不到；"
+            "系统默认会跟随 Windows 默认输出，可能被改成 CABLE。"
+        )
+        self._select(self.local_speaker, settings.duplex_local_speaker)
+
+        self.mic = flexible_combo(ChevronCombo())
         self.mic.addItem("不翻译麦克风", "__off__")
         self.mic.addItem("系统默认", None)
         for n in audio.list_microphones():
             self.mic.addItem(n, n)
         self._select(self.mic, settings.mic_device if settings.mic_enabled else "__off__")
 
-        self.direction = flexible_combo(QComboBox())
+        self.direction = flexible_combo(ChevronCombo())
         for d in lang.DIRECTIONS.values():
             note = "（SenseVoice 识别" + ("）" if model_ready("sensevoice") else "，需下载约 230MB）")
             self.direction.addItem(d.label + (note if d.key == lang.ZH_JA else ""), d.key)
         self._select(self.direction, settings.direction)
         self.direction_note = QLabel("")
-        self.direction_note.setStyleSheet("color:#888")
+        self.direction_note.setStyleSheet("color:#8991a4")
         direction_row = QHBoxLayout()
         direction_row.addWidget(self.direction, 1)
         direction_row.addWidget(self.direction_note)
 
-        self.engine = flexible_combo(QComboBox())
+        self.engine = flexible_combo(ChevronCombo())
         for key, label in ENGINES:
             self.engine.addItem(label + ("" if model_ready(key) else "（需下载）"), key)
         self._select(self.engine, settings.asr_engine)
 
-        self.provider = flexible_combo(QComboBox())
+        self.provider = flexible_combo(ChevronCombo())
         self.provider.addItem("GitHub Copilot", "copilot")
         self.provider.addItem("自定义（OpenAI 兼容）", "openai")
         self._select(self.provider, settings.provider)
 
         self.profiles: list[dict] = [dict(p) for p in settings.profiles]
-        self.profile_combo = flexible_combo(QComboBox(), 12)
+        self.profile_combo = flexible_combo(ChevronCombo(), 12)
         self._reload_profiles(settings.active_profile)
         self.btn_profile_new = QPushButton("新建…")
         self.btn_profile_edit = QPushButton("编辑…")
@@ -1096,10 +1426,15 @@ class SettingsDialog(QDialog):
         profile_row.addWidget(self.btn_profile_edit)
         profile_row.addWidget(self.btn_profile_del)
         self.provider_note = QLabel("")
-        self.provider_note.setStyleSheet("color:#888")
+        self.provider_note.setStyleSheet("color:#8991a4")
         self.provider_note.setWordWrap(True)
+        profile_box = QVBoxLayout()
+        profile_box.setContentsMargins(0, 0, 0, 0)
+        profile_box.setSpacing(4)
+        profile_box.addLayout(profile_row)
+        profile_box.addWidget(self.provider_note)
 
-        self.model = flexible_combo(QComboBox(), 16)
+        self.model = flexible_combo(ChevronCombo(), 16)
         self.btn_refresh = QPushButton("刷新")
         self.btn_bench = QPushButton("测速")
         self.btn_refresh.clicked.connect(self._refresh)
@@ -1110,15 +1445,20 @@ class SettingsDialog(QDialog):
         model_row.addWidget(self.btn_bench)
         self.model_info = QLabel("")
         self.model_info.setWordWrap(True)
+        model_box = QVBoxLayout()
+        model_box.setContentsMargins(0, 0, 0, 0)
+        model_box.setSpacing(4)
+        model_box.addLayout(model_row)
+        model_box.addWidget(self.model_info)
         self._models: list[ModelOption] = []
         self.set_models(models)
 
-        self.effort = QComboBox()
+        self.effort = ChevronCombo()
         self.effort.addItems(EFFORTS)
         self.effort.setCurrentText(settings.reasoning_effort)
         self._sync_effort_choices()
 
-        self.rotate = QSpinBox()
+        self.rotate = ChevronSpin()
         self.rotate.setRange(5, 240)
         self.rotate.setSuffix(" 分钟")
         self.rotate.setValue(settings.session_rotate_minutes)
@@ -1134,11 +1474,38 @@ class SettingsDialog(QDialog):
         self.fillers_zh = QLineEdit("、".join(settings.fillers_zh))
         self.fillers_zh.setToolTip("中→日时使用；单独成句时只显示不翻译，用「、」或逗号分隔")
 
-        self.font = QSpinBox()
+        self.font_family = ChevronFontCombo()
+        self.font_family.setCurrentFont(QFont(settings.font_family or "Microsoft YaHei UI"))
+        self.font_family.setToolTip("会议实时翻译 / 语音实时转译的悬浮字幕字体（原文、译文共用）")
+        # 原文（识别出的那句话）与译文各自设字号和颜色
+        self.src_font = ChevronSpin()
+        self.src_font.setRange(9, 48)
+        self.src_font.setSuffix(" pt")
+        self.src_font.setValue(settings.source_font_size)
+        self.src_font.setToolTip("悬浮框里原文（识别结果）的字号；未完成的识别片段也用它")
+        self.src_font_color = ColorButton(settings.source_font_color)
+        self.src_font_color.setToolTip("悬浮框里原文的颜色；未完成的识别片段也用它")
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("字号"))
+        src_row.addWidget(self.src_font)
+        src_row.addWidget(QLabel("颜色"))
+        src_row.addWidget(self.src_font_color)
+        src_row.addStretch(1)
+        self.font = ChevronSpin()
         self.font.setRange(9, 48)
+        self.font.setSuffix(" pt")
         self.font.setValue(settings.font_size)
+        self.font.setToolTip("悬浮框里译文的字号；字幕模式（只显示译文）也用它")
+        self.font_color = ColorButton(settings.font_color)
+        self.font_color.setToolTip("悬浮框里译文的颜色")
+        zh_row = QHBoxLayout()
+        zh_row.addWidget(QLabel("字号"))
+        zh_row.addWidget(self.font)
+        zh_row.addWidget(QLabel("颜色"))
+        zh_row.addWidget(self.font_color)
+        zh_row.addStretch(1)
 
-        self.opacity = QDoubleSpinBox()
+        self.opacity = ChevronDoubleSpin()
         self.opacity.setRange(0.2, 1.0)
         self.opacity.setSingleStep(0.05)
         self.opacity.setValue(settings.opacity)
@@ -1151,6 +1518,9 @@ class SettingsDialog(QDialog):
         self.hotkey = QLineEdit(settings.hotkey)
         self.selection_hotkey = QLineEdit(settings.selection_hotkey)
 
+        self.selection_font_family = ChevronFontCombo()
+        self.selection_font_family.setCurrentFont(QFont(settings.selection_font_family or "Microsoft YaHei UI"))
+        self.selection_font_family.setToolTip("划词/句翻译弹窗的字体，与悬浮框分开设置")
         self.chinese_size = self._px_spin(settings.selection_chinese_px)
         self.chinese_color = ColorButton(settings.selection_chinese_color)
         chinese_row = QHBoxLayout()
@@ -1221,75 +1591,138 @@ class SettingsDialog(QDialog):
         save_row.addWidget(btn_browse)
         save_row.addWidget(btn_reset_dir)
 
-        form.addRow("对方声音（扬声器环回）", self.speaker)
-        form.addRow("我的声音（麦克风）", self.mic)
-        form.addRow("翻译方向", direction_row)
-        form.addRow("语音识别引擎（日→中）", self.engine)
-        form.addRow("识别纠错", self.asr_correct)
-        form.addRow("模型服务", self.provider)
-        form.addRow("端点", profile_row)
-        form.addRow("", self.provider_note)
-        form.addRow("翻译模型", model_row)
-        form.addRow("", self.model_info)
-        form.addRow("推理强度（思考档位）", self.effort)
-        form.addRow("会话轮换间隔", self.rotate)
-        form.addRow("断句：静音判定", self.silence)
-        form.addRow("断句：未说完最多等待", self.hold)
-        form.addRow("断句：合并上限", self.hold_max)
-        form.addRow("语气词·日语（不翻译）", self.fillers)
-        form.addRow("语气词·中文（不翻译）", self.fillers_zh)
-        form.addRow("译文字号", self.font)
-        form.addRow("背景不透明度", self.opacity)
-        form.addRow("悬浮框", self.show_overlay)
-        form.addRow("字幕模式", self.subtitle_mode)
-        form.addRow("开始/暂停快捷键", self.hotkey)
-        form.addRow("划词/句翻译快捷键", self.selection_hotkey)
-        form.addRow("划词/句翻译：中文译文", chinese_row)
-        form.addRow("划词/句翻译：假名", kana_row)
-        form.addRow("划词/句翻译：汉字", kanji_row)
-        form.addRow("悬浮窗显示内容", display_box)
-        form.addRow("翻译历史", history_row)
-        form.addRow("会议记录保存位置", save_row)
-        hint = QLabel(
-            "<small>模型与推理强度、麦克风开关在会议中修改会立即生效；"
-            "设备、翻译方向、识别引擎、识别纠错、静音判定在下一次「开始」时生效。</small>"
+        form_dev.addRow("对方声音（单方向环回）", self.speaker)
+        form_dev.addRow("对方声音（双向同传采集）", self.capture_speaker)
+        form_dev.addRow("我的声音（麦克风）", self.mic)
+        form_dev.addRow("本地耳机（中文 TTS）", self.local_speaker)
+        form_tr.addRow("翻译方向", direction_row)
+        form_tr.addRow("语音识别引擎（日→中）", self.engine)
+        form_tr.addRow("识别纠错", self.asr_correct)
+        form_tr.addRow("模型服务", self.provider)
+        form_tr.addRow("端点", profile_box)
+        form_tr.addRow("翻译模型", model_box)
+        form_tr.addRow("推理强度（思考档位）", self.effort)
+        form_tr.addRow("会话轮换间隔", self.rotate)
+        form_seg.addRow("断句：静音判定", self.silence)
+        form_seg.addRow("断句：未说完最多等待", self.hold)
+        form_seg.addRow("断句：合并上限", self.hold_max)
+        form_seg.addRow("语气词·日语（不翻译）", self.fillers)
+        form_seg.addRow("语气词·中文（不翻译）", self.fillers_zh)
+        form_ov.addRow("字体", self.font_family)
+        form_ov.addRow("原文 字号 / 颜色", src_row)
+        form_ov.addRow("译文 字号 / 颜色", zh_row)
+        form_ov.addRow("背景不透明度", self.opacity)
+        form_ov.addRow("悬浮框", self.show_overlay)
+        form_ov.addRow("字幕模式", self.subtitle_mode)
+        form_ov.addRow("显示内容", display_box)
+        form_ov.addRow("开始/暂停快捷键", self.hotkey)
+        form_sel.addRow("字体", self.selection_font_family)
+        form_sel.addRow("划词/句翻译快捷键", self.selection_hotkey)
+        form_sel.addRow("中文译文", chinese_row)
+        form_sel.addRow("假名", kana_row)
+        form_sel.addRow("汉字", kanji_row)
+        form_data.addRow("翻译历史", history_row)
+        form_data.addRow("会议记录保存位置", save_row)
+        # ---- 外观：左边分区导航，右边卡片，底边固定按钮 ----
+        self.setStyleSheet(SETTINGS_QSS)
+        header = QWidget()
+        head_lay = QVBoxLayout(header)
+        head_lay.setContentsMargins(22, 18, 22, 12)
+        head_lay.setSpacing(5)
+        title = QLabel("设置")
+        title.setObjectName("dialogTitle")
+        subtitle = QLabel(
+            "改动点「保存」后生效。会议中改模型、推理强度、麦克风开关会立即生效；"
+            "设备、翻译方向、识别引擎、断句、识别纠错在下一次「开始」时生效。"
         )
-        hint.setWordWrap(True)
-        form.addRow(hint)
-        self.dirty_hint = QLabel("")
-        self.dirty_hint.setStyleSheet("color:#d9822b")
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        self.btn_defaults = QPushButton("默认")
-        self.btn_defaults.setToolTip("把所有设置恢复为默认值（自定义模型端点保留），点击 OK 后生效")
-        self.btn_defaults.setAutoDefault(False)
-        self.btn_defaults.clicked.connect(self._confirm_restore_defaults)
+        subtitle.setObjectName("dialogSubtitle")
+        subtitle.setWordWrap(True)
+        head_lay.addWidget(title)
+        head_lay.addWidget(subtitle)
+        head_lay.addWidget(self.service_error)
 
-        # 表单放滚动区，按钮固定在底部：设置项只增不减，窗口必须能缩，
-        # 否则 125% 缩放下 843px 的高度会让 OK/取消 掉到屏幕外。
-        content = QWidget()
-        content.setLayout(form)
-        self.scroll = QScrollArea()
-        self.scroll.setWidget(content)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sections = (
+            ("dev", "声音与设备", "声音与设备",
+             "会议软件把对方声音送到哪个虚拟声卡、中文 TTS 播到哪、麦克风要不要翻译。", form_dev),
+            ("tr", "翻译与模型", "翻译与模型",
+             "翻译方向、识别引擎、模型服务与推理强度。", form_tr),
+            ("seg", "断句与语气词", "断句与语气词",
+             "多久算一句话说完；语气词单独成句时只显示不翻译。", form_seg),
+            ("ov", "悬浮框", "悬浮框",
+             "会议实时翻译、语音实时转译共用的字幕窗外观。", form_ov),
+            ("sel", "划词翻译", "划词翻译弹窗",
+             "鼠标划词或整句翻译时弹出的小窗，字体与悬浮框分开设。", form_sel),
+            ("data", "记录与历史", "记录与历史",
+             "会议纪要与划词历史的保存位置。", form_data),
+        )
+        nav_col = QWidget()
+        nav_col.setObjectName("navColumn")
+        nav_col.setFixedWidth(184)
+        nav_lay = QVBoxLayout(nav_col)
+        nav_lay.setContentsMargins(12, 6, 10, 14)
+        nav_lay.setSpacing(2)
+        self.stack = QStackedWidget()
+        self._nav_buttons: dict[str, QPushButton] = {}
+        for key, nav_label, card_title, card_desc, sec_form in sections:
+            btn = QPushButton(nav_label)
+            btn.setObjectName("navItem")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.clicked.connect(lambda _checked=False, k=key: self.show_section(k))
+            self._nav_buttons[key] = btn
+            nav_lay.addWidget(btn)
+            self.stack.addWidget(self._page(card_title, card_desc, sec_form))
+        nav_lay.addStretch(1)
+
+        self.dirty_hint = QLabel("")
+        self.dirty_hint.setObjectName("dirtyHint")
+        self.btn_quit_program = QPushButton("关闭程序")
+        self.btn_quit_program.setObjectName("danger")
+        self.btn_quit_program.setToolTip("直接退出会议翻译（不保存未应用的修改）")
+        self.btn_quit_program.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_quit_program.clicked.connect(self.quit_requested)
+        self.btn_defaults = QPushButton("恢复默认")
+        self.btn_defaults.setToolTip("把所有设置恢复为默认值（自定义模型端点保留），点「保存」后才生效")
+        self.btn_defaults.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_defaults.clicked.connect(self._confirm_restore_defaults)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_save = QPushButton("保存")
+        self.btn_save.setObjectName("primary")
+        self.btn_save.setDefault(True)
+        self.btn_save.clicked.connect(self.accept)
         footer = QWidget()
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(12, 6, 12, 12)
-        footer_layout.addWidget(self.dirty_hint, 1, Qt.AlignmentFlag.AlignRight)
-        footer_layout.addWidget(self.btn_defaults)
-        footer_layout.addWidget(buttons)
+        footer.setObjectName("dialogFooter")
+        footer_lay = QHBoxLayout(footer)
+        footer_lay.setContentsMargins(18, 10, 18, 14)
+        footer_lay.setSpacing(10)
+        footer_lay.addWidget(self.btn_quit_program)
+        footer_lay.addWidget(self.dirty_hint, 1, Qt.AlignmentFlag.AlignRight)
+        footer_lay.addWidget(self.btn_defaults)
+        footer_lay.addWidget(btn_cancel)
+        footer_lay.addWidget(self.btn_save)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(nav_col)
+        body.addWidget(self.stack, 1)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(self.scroll, 1)
+        outer.addWidget(header)
+        outer.addLayout(body, 1)
         outer.addWidget(footer)
-        self.setMinimumSize(660, 420)
-        self.resize(760, 620)
+        self.show_section("dev")
+        self.setMinimumSize(780, 520)
+        self.resize(920, 690)
 
         self._getters: dict[str, Callable[[], object]] = {
             "speaker": self.speaker.currentData,
+            "capture_speaker": self.capture_speaker.currentData,
+            "local_speaker": self.local_speaker.currentData,
             "mic": self.mic.currentData,
             "direction": self.direction.currentData,
             "engine": self.engine.currentData,
@@ -1304,7 +1737,12 @@ class SettingsDialog(QDialog):
             "hold_max": self.hold_max.value,
             "fillers": self.fillers.text,
             "fillers_zh": self.fillers_zh.text,
+            "font_family": lambda: self.font_family.currentFont().family(),
+            "src_font": self.src_font.value,
+            "src_font_color": self.src_font_color.color,
             "font": self.font.value,
+            "font_color": self.font_color.color,
+            "selection_font_family": lambda: self.selection_font_family.currentFont().family(),
             "opacity": self.opacity.value,
             "show_overlay": self.show_overlay.isChecked,
             "subtitle_mode": self.subtitle_mode.isChecked,
@@ -1323,15 +1761,17 @@ class SettingsDialog(QDialog):
             "save_dir": self.save_dir.text,
         }
         self._baseline = {k: f() for k, f in self._getters.items()}
-        for w in (self.speaker, self.mic, self.direction, self.engine, self.model, self.effort):
+        for w in (self.speaker, self.capture_speaker, self.local_speaker, self.mic, self.direction, self.engine, self.model, self.effort):
             w.currentIndexChanged.connect(self._update_dirty)
         self.model.currentIndexChanged.connect(self._sync_effort_choices)
         for w in (
-            self.rotate, self.silence, self.hold, self.hold_max, self.font, self.opacity,
+            self.rotate, self.silence, self.hold, self.hold_max, self.font, self.src_font, self.opacity,
             self.chinese_size, self.kana_size, self.kanji_size,
         ):
             w.valueChanged.connect(self._update_dirty)
-        for w in (self.chinese_color, self.kana_color, self.kanji_color):
+        self.font_family.currentFontChanged.connect(self._update_dirty)
+        self.selection_font_family.currentFontChanged.connect(self._update_dirty)
+        for w in (self.font_color, self.src_font_color, self.chinese_color, self.kana_color, self.kanji_color):
             w.colorChanged.connect(self._update_dirty)
         for w in (self.fillers, self.fillers_zh, self.hotkey, self.selection_hotkey, self.save_dir):
             w.textChanged.connect(self._update_dirty)
@@ -1389,7 +1829,7 @@ class SettingsDialog(QDialog):
 
     def set_model_error(self, text: str) -> None:
         if text:
-            self.model_info.setText(f"<small style='color:#c33'>{html.escape(text)}</small>")
+            self.model_info.setText(f"<small style='color:#ff6b6b'>{html.escape(text)}</small>")
 
     def set_service_error(self, text: str) -> None:
         self.service_error.setText(text)
@@ -1405,13 +1845,13 @@ class SettingsDialog(QDialog):
         return any(f() != self._baseline[k] for k, f in self._getters.items())
 
     def _update_dirty(self) -> None:
-        self.dirty_hint.setText("设置已修改，点击 OK 后生效" if self.is_dirty() else "")
+        self.dirty_hint.setText("有未保存的改动" if self.is_dirty() else "")
 
     def _confirm_restore_defaults(self) -> None:
         answer = QMessageBox.question(
             self,
             "恢复默认设置",
-            "把所有设置恢复为默认值？\n自定义模型端点（含 API key）会保留。点击 OK 后才生效。",
+            "把所有设置恢复为默认值？\n自定义模型端点（含 API key）会保留。点「保存」后才生效。",
         )
         if answer == QMessageBox.StandardButton.Yes:
             self._restore_defaults()
@@ -1420,6 +1860,8 @@ class SettingsDialog(QDialog):
         """把对话框里的控件恢复成 Settings() 的默认值；不写盘，点 OK 才应用。"""
         d = Settings()
         self._select(self.speaker, d.loopback_device)
+        self._select(self.capture_speaker, d.duplex_capture_device)
+        self._select(self.local_speaker, d.duplex_local_speaker)
         self._select(self.mic, d.mic_device if d.mic_enabled else "__off__")
         if not self._meeting_active:
             self._select(self.direction, d.direction)
@@ -1442,12 +1884,17 @@ class SettingsDialog(QDialog):
         self.asr_correct.setChecked(d.asr_correct)
         self.fillers.setText("、".join(d.fillers))
         self.fillers_zh.setText("、".join(d.fillers_zh))
+        self.font_family.setCurrentFont(QFont(d.font_family or "Microsoft YaHei UI"))
+        self.src_font.setValue(d.source_font_size)
+        self.src_font_color.set_color(d.source_font_color)
         self.font.setValue(d.font_size)
+        self.font_color.set_color(d.font_color)
         self.opacity.setValue(d.opacity)
         self.show_overlay.setChecked(d.show_overlay)
         self.subtitle_mode.setChecked(d.subtitle_mode)
         self.hotkey.setText(d.hotkey)
         self.selection_hotkey.setText(d.selection_hotkey)
+        self.selection_font_family.setCurrentFont(QFont(d.selection_font_family or "Microsoft YaHei UI"))
         self.chinese_size.setValue(d.selection_chinese_px)
         self.chinese_color.set_color(d.selection_chinese_color)
         self.kana_size.setValue(d.selection_kana_px)
@@ -1495,7 +1942,7 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _px_spin(value: int) -> QSpinBox:
-        w = QSpinBox()
+        w = ChevronSpin()
         w.setRange(8, 72)
         w.setSuffix(" px")
         w.setValue(value)
@@ -1503,7 +1950,7 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _dspin(lo: float, hi: float, step: float, value: float) -> QDoubleSpinBox:
-        w = QDoubleSpinBox()
+        w = ChevronDoubleSpin()
         w.setRange(lo, hi)
         w.setSingleStep(step)
         w.setDecimals(1)
@@ -1687,7 +2134,7 @@ class SettingsDialog(QDialog):
     def bench_done(self, model: str, result) -> None:
         self.btn_bench.setEnabled(True)
         if isinstance(result, Exception):
-            self.model_info.setText(f"<small style='color:#c33'>测速失败：{html.escape(str(result))}</small>")
+            self.model_info.setText(f"<small style='color:#ff6b6b'>测速失败：{html.escape(str(result))}</small>")
             return
         self.set_models(self._models)
         self.model_info.setText(f"<small>{html.escape(model)} 实测平均 {result:.2f}s（已记入统计）</small>")
@@ -1695,6 +2142,8 @@ class SettingsDialog(QDialog):
     def apply(self) -> None:
         s = self.s
         s.loopback_device = self.speaker.currentData()
+        s.duplex_capture_device = self.capture_speaker.currentData()
+        s.duplex_local_speaker = self.local_speaker.currentData()
         mic = self.mic.currentData()
         s.mic_enabled = mic != "__off__"
         if s.mic_enabled:
@@ -1715,12 +2164,17 @@ class SettingsDialog(QDialog):
         s.hold_max_seconds = max(self.hold_max.value(), s.hold_seconds)
         s.fillers = [f.strip() for f in re.split(r"[、,，\s]+", self.fillers.text()) if f.strip()]
         s.fillers_zh = [f.strip() for f in re.split(r"[、,，\s]+", self.fillers_zh.text()) if f.strip()]
+        s.font_family = self.font_family.currentFont().family()
+        s.source_font_size = self.src_font.value()
+        s.source_font_color = self.src_font_color.color()
         s.font_size = self.font.value()
+        s.font_color = self.font_color.color()
         s.opacity = self.opacity.value()
         s.show_overlay = self.show_overlay.isChecked()
         s.subtitle_mode = self.subtitle_mode.isChecked()
         s.hotkey = self.hotkey.text().strip() or s.hotkey
         s.selection_hotkey = self.selection_hotkey.text().strip() or s.selection_hotkey
+        s.selection_font_family = self.selection_font_family.currentFont().family()
         s.selection_chinese_px = self.chinese_size.value()
         s.selection_chinese_color = self.chinese_color.color()
         s.selection_kana_px = self.kana_size.value()
@@ -1733,6 +2187,63 @@ class SettingsDialog(QDialog):
         s.show_meeting_aic = self.show_meeting.isChecked()
         s.save_dir = self.save_dir.text() or None
         s.save()
+
+    # ---- 分区布局 ----
+
+    @staticmethod
+    def _form() -> QFormLayout:
+        """一张分区表单：窄窗口下也不换行，长设备名由下拉框自己省略。"""
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setContentsMargins(20, 10, 20, 20)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        return form
+
+    def _page(self, title: str, desc: str, form: QFormLayout) -> QScrollArea:
+        """一个分区页：深色卡片包着表单，超高时自己滚。"""
+        card = QFrame()
+        card.setObjectName("card")
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+        head = QVBoxLayout()
+        head.setContentsMargins(20, 16, 20, 0)
+        head.setSpacing(3)
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName("cardTitle")
+        desc_lbl = QLabel(desc)
+        desc_lbl.setObjectName("cardDesc")
+        desc_lbl.setWordWrap(True)
+        head.addWidget(title_lbl)
+        head.addWidget(desc_lbl)
+        card_lay.addLayout(head)
+        card_lay.addLayout(form)
+        card_lay.addStretch(1)
+        content = QWidget()
+        content_lay = QVBoxLayout(content)
+        content_lay.setContentsMargins(18, 8, 18, 18)
+        content_lay.addWidget(card)
+        content_lay.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return scroll
+
+    def show_section(self, key: str) -> None:
+        """切到某个分区；导航项跟着高亮，新页面从顶部开始看。"""
+        keys = list(self._nav_buttons)
+        if key not in self._nav_buttons:
+            return
+        for k, btn in self._nav_buttons.items():
+            btn.setChecked(k == key)
+        self.stack.setCurrentIndex(keys.index(key))
+        page = self.stack.currentWidget()
+        if isinstance(page, QScrollArea):
+            page.verticalScrollBar().setValue(0)
 
 
 class LoginDialog(QDialog):
@@ -1877,6 +2388,9 @@ class Bridge(QObject):
     selection_hotkey = Signal()
     usage = Signal(float)
     progress = Signal(str, int, int)  # 会后整理：(阶段说明, 已完成步数, 总步数)
+    duplex_play = Signal(str, str, str)  # (方向, 文本, start|done|direct|clear)
+    home_progress = Signal(str, str, int, int)  # (kind, 文本, 已完成, 总量)
+    home_done = Signal(str, bool, str)  # (kind, 成功, 消息)
     job_done = Signal(object, object)  # (tag, result 或 Exception)；tag 可为 ("cb", 回调)
 
 

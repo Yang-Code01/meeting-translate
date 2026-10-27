@@ -68,6 +68,7 @@ class Capture:
             ME: lambda: _mic(mic_device),
         }
         self._enabled = {THEM: True, ME: mic_enabled}
+        self._mic_device = mic_device
         self._running: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self._started = False
 
@@ -121,5 +122,62 @@ class Capture:
                 while not stop.is_set():
                     data = rec.record(numframes=BLOCK)
                     self._on_audio(source, np.ascontiguousarray(data[:, 0], dtype=np.float32))
+        except Exception as exc:
+            if source == ME and not stop.is_set():
+                log.warning("soundcard 麦克风不可用，改用 sounddevice: %s", exc)
+                self._run_sounddevice(stop)
+            else:
+                log.exception("音频采集失败: %s", source)
+
+    def _run_sounddevice(self, stop: threading.Event) -> None:
+        """soundcard 对部分麦克风（如 HyperX Cloud III）会断言失败，用 PortAudio 兜底。"""
+        try:
+            import sounddevice as sd
         except Exception:
-            log.exception("音频采集失败: %s", source)
+            log.exception("sounddevice 不可用，麦克风保持关闭")
+            return
+
+        try:
+            devices = sd.query_devices()
+            index = None
+            wanted = self._mic_device
+            if wanted:
+                for i, dev in enumerate(devices):
+                    if dev["max_input_channels"] > 0 and wanted in dev["name"]:
+                        index = i
+                        break
+            if index is None:
+                index = sd.default.device[0]
+            if index is None or index < 0:
+                raise RuntimeError("没有可用的默认麦克风")
+
+            rate = None
+            for candidate in (48000, 44100, 16000):
+                try:
+                    sd.check_input_settings(device=index, channels=1, samplerate=candidate, dtype="float32")
+                    rate = candidate
+                    break
+                except Exception:
+                    continue
+            if rate is None:
+                raise RuntimeError("麦克风不支持 48k/44.1k/16k 单声道")
+
+            blocksize = max(1, int(rate * 0.1))
+            with sd.RawInputStream(
+                device=index, channels=1, samplerate=rate, dtype="float32", blocksize=blocksize
+            ) as stream:
+                while not stop.is_set():
+                    data, overflowed = stream.read(blocksize)
+                    if overflowed:
+                        log.debug("麦克风溢出")
+                    samples = np.frombuffer(data, dtype=np.float32)
+                    if rate != SAMPLE_RATE:
+                        count = int(round(samples.size * SAMPLE_RATE / rate))
+                        if count > 0:
+                            old = np.linspace(0.0, 1.0, samples.size, endpoint=False)
+                            new = np.linspace(0.0, 1.0, count, endpoint=False)
+                            samples = np.interp(new, old, samples).astype(np.float32)
+                    if samples.size:
+                        self._on_audio(ME, np.ascontiguousarray(samples, dtype=np.float32))
+        except Exception:
+            log.exception("sounddevice 麦克风采集失败")

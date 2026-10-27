@@ -10,6 +10,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import numpy as np
+
 # 以这些结尾视为没说完（助词、接续形）
 INCOMPLETE_ENDINGS = (
     "て", "で", "が", "けど", "けれど", "けれども", "ので", "のに", "を", "は", "と", "に", "も",
@@ -59,6 +61,8 @@ class Pending:
     first_mono: float
     deadline: float = 0.0
     pieces: list[str] = field(default_factory=list)
+    lang: str = ""
+    audio: np.ndarray | None = None
 
 
 class Joiner:
@@ -79,28 +83,43 @@ class Joiner:
         on_commit: Callable[[Pending, bool], None],
         ids: itertools.count | None = None,
         lang: str = "ja",
+        langs: dict[str, str] | None = None,
+        lang_for_source: Callable[[str], str] | None = None,
     ) -> None:
         self.hold = hold_seconds
         self.hold_max = hold_max_seconds
         self.fillers = fillers
         self.lang = lang
+        self._lang_for_source = lang_for_source or (lambda source: (langs or {}).get(source, lang))
         self._on_open = on_open
         self._on_update = on_update
         self._on_commit = on_commit
         self._ids = ids or itertools.count(1)
         self._pending: dict[str, Pending] = {}
 
-    def add(self, source: str, text: str, wall: float, mono: float) -> None:
+    def add(
+        self,
+        source: str,
+        text: str,
+        wall: float,
+        mono: float,
+        lang: str | None = None,
+        audio: np.ndarray | None = None,
+    ) -> None:
         p = self._pending.get(source)
+        detected = lang or self._lang_for_source(source)
         if p is None:
-            p = Pending(next(self._ids), source, text, wall, mono, pieces=[text])
+            p = Pending(next(self._ids), source, text, wall, mono, pieces=[text], lang=detected, audio=audio)
             self._pending[source] = p
             self._on_open(p)
         else:
             p.ja += text
             p.pieces.append(text)
+            p.lang = detected
+            if audio is not None:
+                p.audio = audio if p.audio is None else np.concatenate((p.audio, audio))
             self._on_update(p)
-        if is_complete(p.ja, self.lang) or mono - p.first_mono >= self.hold_max:
+        if is_complete(p.ja, detected) or mono - p.first_mono >= self.hold_max:
             self._commit(source)
         else:
             p.deadline = mono + self.hold

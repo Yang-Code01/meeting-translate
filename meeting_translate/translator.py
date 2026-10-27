@@ -89,6 +89,7 @@ class Translation:
     texts: list[str]
     latency: float  # 从最早一句定稿到译文返回（秒）
     sources: list[str] | None = None  # LLM 校正后的原文；None/空串 = 未校正
+    direction: str = lang.JA_ZH  # 这一批属于哪个方向（双向会议时区分）
 
 
 @dataclass
@@ -191,9 +192,14 @@ class Translator:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="translator", daemon=True)
         self._session: Session | None = None
+        self._sessions: dict[str, Session] = {}
         self._session_started = 0.0
+        self._session_started_by: dict[str, float] = {}
         self._segment_start_wall = 0.0
+        self._segment_start_wall_by: dict[str, float] = {}
         self._summary = ""
+        self._summaries: dict[str, str] = {}
+        self._directions: list[str] = []
         self._send_lock: asyncio.Lock | None = None
         self._selection_lock: asyncio.Lock | None = None
         self._selection_session: Session | None = None
@@ -201,6 +207,7 @@ class Translator:
         self._selection_count = 0
         self._queue: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None
+        self._pending = 0
         self._rotating = False
         self._transcript: Transcript | None = None
         self._model = ""
@@ -228,7 +235,12 @@ class Translator:
 
     def submit(self, final: Final) -> None:
         if self._queue is not None:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, final)
+            self._loop.call_soon_threadsafe(self._enqueue, final)
+
+    def _enqueue(self, final: Final) -> None:
+        if self._queue is None:
+            return
+        self._queue.put_nowait(final)
 
     def start_meeting(
         self,
@@ -239,8 +251,11 @@ class Translator:
         context_n: int,
         terms: list[glossary.Term],
         correct: bool = False,
+        directions: list[str] | None = None,
     ) -> concurrent.futures.Future:
-        return self._call(self._start_meeting(transcript, model, effort, rotate_minutes, context_n, terms, correct))
+        return self._call(
+            self._start_meeting(transcript, model, effort, rotate_minutes, context_n, terms, correct, directions)
+        )
 
     def end_meeting(self) -> concurrent.futures.Future:
         return self._call(self._end_meeting())
@@ -255,10 +270,15 @@ class Translator:
         """换后端（设置里切换服务商/端点后调用）：关旧会话、启新后端并重新预热。"""
         return self._call(self._switch_backend(backend))
 
+    async def _close_all_sessions(self) -> None:
+        sessions = list({id(s): s for s in [*self._sessions.values(), self._session] if s is not None}.values())
+        self._sessions.clear()
+        self._session = None
+        for s in sessions:
+            await s.close()
+
     async def _switch_backend(self, backend: Backend) -> AuthState:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        await self._close_all_sessions()
         if self._selection_session is not None:
             await self._selection_session.close()
             self._selection_session = None
@@ -400,8 +420,7 @@ class Translator:
     async def _shutdown(self) -> None:
         if self._worker:
             self._worker.cancel()
-        if self._session is not None:
-            await self._session.close()
+        await self._close_all_sessions()
         if self._selection_session is not None:
             await self._selection_session.close()
             self._selection_session = None
@@ -415,20 +434,52 @@ class Translator:
     def _direction(self) -> str:
         return self._transcript.direction if self._transcript is not None else lang.JA_ZH
 
-    def _system_with_context(self) -> str:
-        direction = self._direction()
+    def _final_direction(self, final) -> str:
+        direction = getattr(final, "direction", None)
+        if direction in lang.DIRECTIONS:
+            return direction
+        transcript_dir = self._transcript.direction if self._transcript is not None else None
+        if transcript_dir in lang.DIRECTIONS:
+            return transcript_dir
+        # 双向会议：旧调用方没填 direction 时按来源判断。
+        return lang.ZH_JA if getattr(final, "source", "") == "我" else lang.JA_ZH
+
+    def _session_for(self, direction: str) -> Session | None:
+        session = self._sessions.get(direction)
+        if session is not None:
+            return session
+        if self._session is not None and direction == self._direction():
+            return self._session
+        return None
+
+    def _summary_for(self, direction: str) -> str:
+        return self._summaries.get(direction, self._summary)
+
+    def _session_started_for(self, direction: str) -> float:
+        return self._session_started_by.get(direction, self._session_started)
+
+    def _segment_start_for(self, direction: str) -> float:
+        return self._segment_start_wall_by.get(direction, self._segment_start_wall)
+
+    def _system_with_context(self, direction: str | None = None) -> str:
+        direction = direction or self._direction()
+        if direction == "bi":
+            direction = lang.JA_ZH
         parts = [system_prompt(direction, self._correct), glossary.to_prompt(self._terms, direction)]
-        if self._summary:
-            parts.append("会议前情摘要：\n" + self._summary)
+        summary = self._summary_for(direction)
+        if summary:
+            parts.append("会议前情摘要：\n" + summary)
         if self._transcript is not None:
-            recent = self._transcript.last(self._context_n)
+            recent = self._transcript.last(self._context_n, direction)
             if recent:
                 parts.append(
                     "最近的发言与译文：\n" + "\n".join(f"【{e.source}】{e.ja}\n→ {e.zh}" for e in recent)
                 )
         return "\n\n".join(p for p in parts if p)
 
-    async def _start_meeting(self, transcript, model, effort, rotate_minutes, context_n, terms, correct=False) -> None:
+    async def _start_meeting(
+        self, transcript, model, effort, rotate_minutes, context_n, terms, correct=False, directions: list[str] | None = None
+    ) -> None:
         self._transcript = transcript
         self._model, self._effort = model, effort
         self._rotate_seconds = rotate_minutes * 60
@@ -436,22 +487,51 @@ class Translator:
         self._terms = terms
         self._correct = correct
         self._summary = ""
+        self._summaries = {}
+        if directions:
+            dirs = list(dict.fromkeys(directions))
+        elif transcript.direction == "bi":
+            dirs = [lang.JA_ZH, lang.ZH_JA]
+        else:
+            dirs = [transcript.direction]
+        self._directions = dirs
+        self._session_started_by = {}
+        self._segment_start_wall_by = {}
         self.usage = Usage(self._on_usage)
         assert self._send_lock is not None
-        new = await self.new_session(self._system_with_context(), model, effort, self.usage)
+
+        new_sessions: dict[str, Session] = {}
         try:
-            await self._prime(new)
+            for direction in dirs:
+                new = await self.new_session(self._system_with_context(direction), model, effort, self.usage)
+                try:
+                    await self._prime(new)
+                except Exception:
+                    await new.close()
+                    raise
+                new_sessions[direction] = new
         except Exception:
-            await new.close()
+            for s in new_sessions.values():
+                await s.close()
             raise
+
         async with self._send_lock:
-            old = self._session
-            self._session = new
-            self._session_started = time.monotonic()
-            self._segment_start_wall = time.time()
-        if old is not None:
+            old_sessions = list(
+                {id(s): s for s in [*self._sessions.values(), self._session] if s is not None}.values()
+            )
+            self._sessions = new_sessions
+            self._session = new_sessions[dirs[0]]
+            now = time.monotonic()
+            wall = time.time()
+            self._session_started = now
+            self._segment_start_wall = wall
+            for direction in dirs:
+                self._session_started_by[direction] = now
+                self._segment_start_wall_by[direction] = wall
+        for old in old_sessions:
             await old.close()
-        self._on_status(f"会话已建立（{model}）")
+        labels = "、".join(lang.get(d).label for d in dirs)
+        self._on_status(f"会话已建立（{model}，{labels}）")
 
     async def _end_meeting(self) -> None:
         assert self._queue is not None
@@ -462,22 +542,23 @@ class Translator:
             await asyncio.sleep(0.5)
         # 等待队列里剩余的句子翻完
         for _ in range(int(REQUEST_TIMEOUT * 2)):
-            if self._queue.empty() and not (self._send_lock and self._send_lock.locked()):
+            if self._queue.empty() and self._pending == 0 and not (self._send_lock and self._send_lock.locked()):
                 break
             await asyncio.sleep(0.5)
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        await self._close_all_sessions()
+        self._directions = []
         self._transcript = None
 
     async def _switch_model(self, model: str, effort: str) -> None:
-        if self._session is None or self._transcript is None:
+        if (not self._sessions and self._session is None) or self._transcript is None:
             self._model, self._effort = model, effort
             return
         while self._rotating:
             await asyncio.sleep(0.5)
         self._rotating = True
-        await self._rotate(model, effort)
+        dirs = self._directions or [self._direction()]
+        for direction in dirs:
+            await self._rotate(model, effort, direction)
 
     async def _benchmark(self, model: str, effort: str, direction: str) -> float:
         s = await self.new_session(system_prompt(direction), model, effort, self.usage if self._transcript else None)
@@ -549,23 +630,29 @@ class Translator:
         if old is not None:
             await old.close()
 
-    async def _rotate(self, model: str | None = None, effort: str | None = None) -> None:
+    async def _rotate(self, model: str | None = None, effort: str | None = None, direction: str | None = None) -> None:
         """后台生成摘要并新建会话（可换模型）；期间旧会话继续翻译。"""
+        direction = direction or self._direction()
+        if direction == "bi":
+            direction = lang.JA_ZH
         target = model or self._model
         target_effort = effort if model else self._effort
         try:
             transcript = self._transcript
             if transcript is None:
                 return
-            segment = transcript.since(self._segment_start_wall)
+            segment = transcript.since(self._segment_start_for(direction), direction)
+            summary = self._summary_for(direction)
             if segment:
                 text = "\n".join(f"【{e.source}】{e.ja}\n→ {e.zh or ''}" for e in segment)
-                prompt = (f"已有前情摘要：\n{self._summary}\n\n" if self._summary else "") + "新片段：\n" + text
-                s = await self.new_session(segment_summary_prompt(transcript.direction), self._model, "low", self.usage)
+                prompt = (f"已有前情摘要：\n{summary}\n\n" if summary else "") + "新片段：\n" + text
+                s = await self.new_session(segment_summary_prompt(direction), self._model, "low", self.usage)
                 reply = await s.send(prompt, timeout=180)
                 await s.close()
-                self._summary = reply or self._summary
-            new = await self.new_session(self._system_with_context(), target, target_effort, self.usage)
+                summary = reply or summary
+                self._summaries[direction] = summary
+                self._summary = summary
+            new = await self.new_session(self._system_with_context(direction), target, target_effort, self.usage)
             try:
                 await self._prime(new)
             except Exception:
@@ -573,10 +660,16 @@ class Translator:
                 raise
             assert self._send_lock is not None
             async with self._send_lock:
-                old, self._session = self._session, new
+                old = self._sessions.get(direction)
+                self._sessions[direction] = new
+                if direction == (self._directions[0] if self._directions else direction):
+                    self._session = new
                 self._model, self._effort = target, target_effort
-                self._session_started = time.monotonic()
+                now = time.monotonic()
+                self._session_started = now
+                self._session_started_by[direction] = now
                 self._segment_start_wall = time.time()
+                self._segment_start_wall_by[direction] = self._segment_start_wall
             if old is not None:
                 await old.close()
             self._on_status(f"已切换到 {target}" if model else "已轮换翻译会话（携带前情摘要）")
@@ -594,37 +687,49 @@ class Translator:
         assert self._queue is not None and self._send_lock is not None
         while True:
             first = await self._queue.get()
+            self._pending += 1
             batch = [first]
             while not self._queue.empty():
                 batch.append(self._queue.get_nowait())
-            if self._session is None:
-                continue
-            if (
-                not self._rotating
-                and self._rotate_seconds > 0
-                and time.monotonic() - self._session_started >= self._rotate_seconds
-            ):
-                self._rotating = True
-                asyncio.create_task(self._rotate())
-            sources: list[str] | None = None
+                self._pending += 1
+
             try:
-                async with self._send_lock:
-                    model = self._model
-                    correct = self._correct
-                    reply = await self._session.send(_format_batch(batch, correct), timeout=REQUEST_TIMEOUT)
-                parsed = _parse_corrected(reply, len(batch)) if correct else None
-                if parsed is not None:
-                    sources, texts = parsed
-                else:
-                    texts = _parse_batch(reply, len(batch))
-                ok = True
-            except Exception as e:
-                log.exception("翻译失败")
-                self._on_status(f"翻译失败：{e}")
-                texts = ["（翻译失败）"] * len(batch)
-                ok = False
-            latency = time.monotonic() - min(f.mono_time for f in batch)
-            if ok and len(batch) == 1:
-                stats.get().record_latency(model, latency)
-            self._on_translation(Translation([f.id for f in batch], texts, latency, sources))
+                groups: dict[str, list] = {}
+                for final in batch:
+                    groups.setdefault(self._final_direction(final), []).append(final)
+
+                for direction, items in groups.items():
+                    session = self._session_for(direction)
+                    if session is None:
+                        continue
+                    if (
+                        not self._rotating
+                        and self._rotate_seconds > 0
+                        and time.monotonic() - self._session_started_for(direction) >= self._rotate_seconds
+                    ):
+                        self._rotating = True
+                        asyncio.create_task(self._rotate(direction=direction))
+                    sources: list[str] | None = None
+                    try:
+                        async with self._send_lock:
+                            model = self._model
+                            correct = self._correct
+                            reply = await session.send(_format_batch(items, correct), timeout=REQUEST_TIMEOUT)
+                        parsed = _parse_corrected(reply, len(items)) if correct else None
+                        if parsed is not None:
+                            sources, texts = parsed
+                        else:
+                            texts = _parse_batch(reply, len(items))
+                        ok = True
+                    except Exception as e:
+                        log.exception("翻译失败")
+                        self._on_status(f"翻译失败：{e}")
+                        texts = ["（翻译失败）"] * len(items)
+                        ok = False
+                    latency = time.monotonic() - min(f.mono_time for f in items)
+                    if ok and len(items) == 1:
+                        stats.get().record_latency(model, latency)
+                    self._on_translation(Translation([f.id for f in items], texts, latency, sources, direction))
+            finally:
+                self._pending -= len(batch)
 

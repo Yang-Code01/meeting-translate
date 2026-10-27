@@ -50,7 +50,7 @@ def find_model(name: str) -> Path | None:
 
 DEFAULT_FILLERS = ["え", "あ", "えー", "えーと", "あの", "うん", "ん"]
 DEFAULT_FILLERS_ZH = ["嗯", "啊", "呃", "哦", "额", "那个", "就是"]
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 5
 
 
 @dataclass
@@ -66,6 +66,7 @@ class Settings:
     mic_enabled: bool = False  # 新安装默认关闭，避免旁人说话被记为「我」
     hotkey: str = "Ctrl+Alt+J"
     selection_hotkey: str = "Alt+M"
+    selection_font_family: str = "Microsoft YaHei UI"  # 划词/句翻译弹窗字体
     selection_chinese_px: int = 10  # 划词/句翻译弹窗：中文译文字号（像素）
     selection_kana_px: int = 10  # 划词/句翻译弹窗：假名字号（像素）
     selection_kanji_px: int = 10  # 划词/句翻译弹窗：汉字字号（像素）
@@ -83,7 +84,12 @@ class Settings:
     fillers_zh: list[str] = field(default_factory=lambda: list(DEFAULT_FILLERS_ZH))
     context_sentences: int = 5
     asr_correct: bool = True  # 翻译时让 LLM 一并校正识别原文
-    font_size: int = 16
+    font_family: str = "Microsoft YaHei UI"
+    # 悬浮框原文（识别出的那句话）与译文分开设置字号/字色，单位 pt
+    source_font_size: int = 12
+    source_font_color: str = "#ffffff"  # 原文颜色；未完成的识别片段也用它
+    font_color: str = "#ffffff"  # 悬浮框字幕（译文）文字颜色
+    font_size: int = 16  # 悬浮框字幕（译文）字号
     opacity: float = 0.85
     show_overlay: bool = True  # 是否显示置顶悬浮字幕窗（关闭后只留托盘和快捷键）
     subtitle_mode: bool = False  # 字幕模式：悬浮窗只显示译文，不显示原文和未翻译片段
@@ -97,6 +103,22 @@ class Settings:
     # 每条自定义端点：name / base_url / model / api_key（dpapi 密文）/
     # input_price / output_price（元每百万 token）/ verify_tls
     profiles: list[dict] = field(default_factory=list)
+    # 双向同传（P0/P1 先只落配置，UI 与音频路由在后续阶段接入）
+    meeting_mode: str = "captions"  # captions | duplex
+    duplex_zh_ja: bool = True  # 中转日：我的中文 -> 日语 TTS 给对方；关 = 麦克风原声直通
+    duplex_ja_zh: bool = True  # 日转中：对方日语 -> 中文 TTS 给我；关 = 对方原声直通
+    duplex_mic_device: str | None = None
+    duplex_capture_device: str | None = None  # CABLE-A Input（扬声器名，App 环回采集对方）
+    duplex_remote_speaker: str | None = None  # CABLE-B Input（对方听到的日语 TTS）
+    duplex_local_speaker: str | None = None  # 耳机（我听到的中文 TTS）
+    duplex_tts_enabled: bool = True
+    duplex_tts_voice: str = "koharune_ami"
+    duplex_tts_style: str = "Neutral"
+    duplex_tts_speed: float = 1.0
+    duplex_tts_volume: float = 0.8
+    duplex_queue_max: int = 2
+    duplex_context_turns: int = 3
+    duplex_latency_target: float = 3.0
 
     def profile(self, name: str | None = None) -> dict | None:
         target = name or self.active_profile
@@ -108,12 +130,18 @@ class Settings:
         return None
 
     def effective_engine(self) -> str:
+        if self.meeting_mode == "duplex":
+            return "sensevoice"
         return "sensevoice" if self.direction == "zh-ja" else self.asr_engine
 
     def asr_language(self) -> str:
+        if self.meeting_mode == "duplex":
+            return "auto"
         return "zh" if self.direction == "zh-ja" else "ja"
 
     def active_fillers(self) -> list[str]:
+        if self.meeting_mode == "duplex":
+            return self.fillers + self.fillers_zh
         return self.fillers_zh if self.direction == "zh-ja" else self.fillers
 
     @classmethod
@@ -122,15 +150,33 @@ class Settings:
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                # 每步只把版本推进到自己那一步（写成 SETTINGS_VERSION 会让后面的步骤整段跳过，
+                # 比如 v2 配置升到 v5 时，v4 的 direction="bi" 升级和 v5 的字号拆分都不会执行）。
                 if data.get("version", 1) < 2:
                     data.pop("max_segment_seconds", None)  # v1 的 6 秒强制切分改为 10 秒
-                    data["version"] = SETTINGS_VERSION
+                    data["version"] = 2
                 if data.get("version", 1) < 3:
                     data.setdefault("provider", "copilot")  # v2 之前只有 Copilot
                     data.setdefault("active_profile", "")
                     data.setdefault("profiles", [])
-                    data["version"] = SETTINGS_VERSION
+                    data["version"] = 3
+                if data.get("version", 1) < 4:
+                    # v4 新增双向同传字段；旧的 direction="bi" 自动升级为 duplex。
+                    if data.get("direction") == "bi":
+                        data.setdefault("meeting_mode", "duplex")
+                    data["version"] = 4
+                if data.get("version", 1) < 5:
+                    # v5 起悬浮框原文/译文分开设置字号字色：旧的字号字色视为译文，
+                    # 原文沿用原来的 0.75 倍字号与同色，视觉上不变。
+                    size = data.get("font_size", 16)
+                    color = data.get("font_color", "#ffffff")
+                    data.setdefault("source_font_size", max(9, round(size * 0.75)))
+                    data.setdefault("source_font_color", color)
+                    data["version"] = 5
+                data["version"] = SETTINGS_VERSION
                 s = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+                if s.meeting_mode not in ("captions", "duplex"):
+                    s.meeting_mode = "captions"
                 if s.asr_engine == "funasr-nano":  # 已移除的引擎，回落到默认
                     s.asr_engine = "sensevoice"
                 s.save()
