@@ -10,6 +10,8 @@ runtime_dir = Path(ensure_runtime_wrapper()).parent  # %LOCALAPPDATA%\github-cop
 
 datas = [
     (str(ROOT / "models"), "models"),
+    # 独立运行时 venv 里的解释器要能直接跑这个脚本（不能 import 包里的代码）
+    (str(ROOT / "meeting_translate" / "tts_worker.py"), "worker"),
     (str(runtime_dir), "copilot_runtime"),
     (str(ROOT / "assets"), "assets"),
 ]

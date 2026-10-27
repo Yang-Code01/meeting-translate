@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from . import tts_runtime
 from .duplex_audio import CableDevices
 from .tts_models import download_groups, human_size, total_download_text
 
@@ -142,6 +143,20 @@ def models_html(root: Path | str) -> str:
         + _para(
             "日文 BERT 是 DeBERTa-v2-large（约 0.4B 参数）的 ONNX 版本，已经是 fp16 半精度；"
             "退回 CPU 上的 PyTorch 推理约 2.4 秒/句，会让每一句日语都晚两秒以上，所以不再压缩。"
+        )
+        + _heading("还要一个 Python 运行时（首次 约 400MB）")
+        + _para(
+            "Style-Bert-VITS2 要求 <span " + _CODE + ">numpy&lt;2</span>，而主程序跑在 numpy 2 上，"
+            "两个约束装不进同一个解释器，所以程序会在你的机器上用 <b>Python 3.12</b> 建一个独立环境，"
+            "只装 onnxruntime（约 70MB）和几个纯 Python 依赖。卡片上的「安装运行时」就干这件事。"
+        )
+        + _list(
+            [
+                "需要机器上装有 Python 3.12（3.13/3.14 目前还没有 numba、llvmlite 的轮子）。",
+                "没有的话点「安装运行时」会提示，并给一个 python.org 的下载链接。",
+                f"装好的环境在 <span {_CODE}>{html.escape(_short_path(tts_runtime.runtime_dir()))}</span>，"
+                "想重装直接删掉这个目录再点一次。",
+            ]
         )
         + _heading("装完以后")
         + _list(

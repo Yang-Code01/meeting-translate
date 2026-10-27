@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,10 @@ from typing import Any
 
 import numpy as np
 
-from .tts_client import PROTOCOL_VERSION
+try:  # 包内导入时与客户端共用协议版本号
+    from .tts_client import PROTOCOL_VERSION
+except ImportError:  # 独立脚本运行（运行时 venv 里没有本项目包）
+    PROTOCOL_VERSION = 1
 
 log = logging.getLogger("tts_worker")
 _PROTOCOL_OUT = None  # 真正的 stdout；库日志可能往 sys.stdout 打印，启动时把它改到 stderr
@@ -107,6 +111,31 @@ class SBV2Engine:
         self._model: Any = None
         self._languages: Any = None
 
+    #: 日文 BERT 的两个目录：g2p/分词用 plain，ONNX 推理用 -onnx
+    _BERT_PLAIN = "deberta-v2-large-japanese-char-wwm"
+    _BERT_ONNX = "deberta-v2-large-japanese-char-wwm-onnx"
+    _TOKENIZER_FILES = ("config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "vocab.txt")
+
+    def _point_bert_paths(self, plain_paths: dict[Any, Any], onnx_paths: dict[Any, Any], languages: Any) -> None:
+        """把日文 BERT 的默认路径指到模型目录。
+
+        style_bert_vits2 默认在**包安装目录**下找 `bert/`（`BASE_DIR = package/..`），
+        我们的模型却在 `models/tts/sbv2/bert/`。这两个字典是模块级共享对象，
+        原地改键就对新旧代码都生效。
+        """
+        plain = self.root / "bert" / self._BERT_PLAIN
+        onnx = self.root / "bert" / self._BERT_ONNX
+        if onnx.is_dir() and not plain.is_dir():
+            plain.mkdir(parents=True, exist_ok=True)
+            for name in self._TOKENIZER_FILES:
+                src, dst = onnx / name, plain / name
+                if src.is_file() and not dst.is_file():
+                    shutil.copy2(src, dst)
+        if plain.is_dir():
+            plain_paths[languages.JP] = plain
+        if onnx.is_dir():
+            onnx_paths[languages.JP] = onnx
+
     def _load(self) -> Any:
         if self._model is not None:
             return self._model
@@ -114,9 +143,22 @@ class SBV2Engine:
             raise FileNotFoundError(f"Style-Bert-VITS2 目录不存在：{self.root}")
         # style_bert_vits2 默认从当前目录下的 bert/ 找 ONNX BERT；切到 runtime 根目录。
         os.chdir(self.root)
-        sys.path.insert(0, str(self.root))
-        from style_bert_vits2.constants import Languages
-        from style_bert_vits2.tts_model import TTSModel
+        try:  # 优先用装好的包（独立运行时 venv 里的 style-bert-vits2）
+            from style_bert_vits2.constants import (
+                DEFAULT_BERT_MODEL_PATHS,
+                DEFAULT_ONNX_BERT_MODEL_PATHS,
+                Languages,
+            )
+            from style_bert_vits2.tts_model import TTSModel
+        except ImportError:  # 兜底：模型目录里自带一份源码时从那里 import
+            sys.path.insert(0, str(self.root))
+            from style_bert_vits2.constants import (
+                DEFAULT_BERT_MODEL_PATHS,
+                DEFAULT_ONNX_BERT_MODEL_PATHS,
+                Languages,
+            )
+            from style_bert_vits2.tts_model import TTSModel
+        self._point_bert_paths(DEFAULT_BERT_MODEL_PATHS, DEFAULT_ONNX_BERT_MODEL_PATHS, Languages)
 
         model_dir = self.root / "model_assets" / "koharune-ami"
         candidates = [model_dir / "koharune-ami.onnx", model_dir / "koharune-ami.safetensors"]

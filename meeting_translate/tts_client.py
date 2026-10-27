@@ -21,6 +21,8 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from . import tts_runtime
+
 log = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
@@ -44,20 +46,40 @@ class TtsAudio:
 
 
 def default_worker_command(models_dir: Path | None = None, device: str = "auto") -> list[str]:
-    """开发环境用当前 Python；打包后可被 sidecar exe/环境变量覆盖。"""
+    """TTS sidecar 的启动命令。
+
+    顺序：环境变量覆盖 → 独立运行时 venv（见 `tts_runtime`，Style-Bert-VITS2 要
+    numpy<2 装不进主环境）→ 打包自带的 `tts_worker.exe` → 同一个 exe 以
+    `--tts-worker` 自启 → 源码环境的当前解释器。
+    """
     override = os.environ.get("MEETING_TRANSLATE_TTS_WORKER")
     if override:
         return shlex.split(override, posix=False)
-    python = os.environ.get("MEETING_TRANSLATE_TTS_PYTHON") or sys.executable
-    command = [python, "-m", "meeting_translate.tts_worker", "--device", device]
-    if models_dir is not None:
-        command += ["--models-dir", str(models_dir)]
+    python = os.environ.get("MEETING_TRANSLATE_TTS_PYTHON")
+    if python:
+        return _module_command(python, models_dir, device)
+    runtime = tts_runtime.worker_command(models_dir, device)
+    if runtime is not None:
+        return runtime
     if getattr(sys, "frozen", False):
         sidecar = Path(sys.executable).with_name("tts_worker.exe")
         if sidecar.exists():
             command = [str(sidecar), "--device", device]
             if models_dir is not None:
                 command += ["--models-dir", str(models_dir)]
+            return command
+        # onefile exe 内部没有可复用的解释器；让同一个 exe 以 sidecar 模式自启
+        command = [sys.executable, "--tts-worker", "--device", device]
+        if models_dir is not None:
+            command += ["--models-dir", str(models_dir)]
+        return command
+    return _module_command(sys.executable, models_dir, device)
+
+
+def _module_command(python: str, models_dir: Path | None, device: str) -> list[str]:
+    command = [python, "-m", "meeting_translate.tts_worker", "--device", device]
+    if models_dir is not None:
+        command += ["--models-dir", str(models_dir)]
     return command
 
 

@@ -371,7 +371,7 @@ class HomeWindow(QWidget):
 
         self.model_card = ResourceCard(
             "语音模型",
-            f"中文 MeloTTS + 日文 SBV2，约 {total_download_text()}；下载后自动加载。",
+            f"中文 MeloTTS + 日文 SBV2，约 {total_download_text()}；首次还要装一个 Python 运行时。",
             primary="下载",
             secondary="详细",
         )
@@ -403,7 +403,7 @@ class HomeWindow(QWidget):
 
         self.hotkey_label = QLabel("")
         self.hotkey_label.setObjectName("hotkey")
-        version = QLabel("v0.3 dev · 本地优先")
+        version = QLabel("v0.3.0 · 本地优先")
         version.setObjectName("hotkey")
         footer = QHBoxLayout()
         footer.addWidget(self.hotkey_label, 1)

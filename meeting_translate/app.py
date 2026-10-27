@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSy
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtCore import QProcess
 
-from . import duplex_audio, glossary, lang, qtcom, stats
+from . import duplex_audio, glossary, lang, qtcom, stats, tts_runtime
 from .asr import AsrEngine, AsrWorker, Final, ModelMissing, create_engine
 from .audio import ME, THEM, Capture
 from .config import (
@@ -834,6 +834,11 @@ class App:
                         "TTS 模型尚未下载；请先在设置里完成语音包下载，或设置 MEETING_TRANSLATE_TTS_DIR",
                         "models_missing",
                     )
+                if not tts_runtime.is_ready():
+                    raise TtsError(
+                        "日语语音合成需要先装语音运行时（首页「语音模型」卡 → 安装运行时，需机器上有 Python 3.12）",
+                        "runtime_missing",
+                    )
                 client = TtsClient(default_worker_command(root, "auto"))
             client.start()
             local = Player(devices.local_speaker)
@@ -1299,7 +1304,10 @@ class App:
         stamp = f" · {time.strftime('%H:%M:%S')} 检测" if rescan else ""
         try:
             missing = self.model_manager.missing("melo", verify_hash=False) + self.model_manager.missing("sbv2", verify_hash=False)
-            if missing:
+            if not tts_runtime.is_ready():
+                # 模型装了也跑不起来：Style-Bert-VITS2 要 numpy<2，得单独一个环境
+                self.home.set_model_state(f"缺语音运行时 · 需要 Python 3.12{stamp}", primary="安装运行时")
+            elif missing:
                 self.home.set_model_state(f"未安装 · 约 {total_download_text()}{stamp}", primary="下载")
             else:
                 self.home.set_model_state(f"已安装 · 启动时加载{stamp}", primary="")
@@ -1322,10 +1330,11 @@ class App:
             return
         if self._model_busy:
             return
-        if action in ("下载", "重新检测"):
-            if action == "重新检测":
-                self._rescan_models()
-                return
+        if action == "重新检测":
+            self._rescan_models()
+        elif action == "安装运行时":
+            self._install_runtime()
+        elif action == "下载":
             self._download_models()
 
     def _rescan_models(self) -> None:
@@ -1359,6 +1368,26 @@ class App:
             except Exception as e:  # noqa: BLE001
                 log.exception("下载语音模型失败")
                 self.bridge.home_done.emit("model", False, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _install_runtime(self) -> None:
+        """用系统 Python 3.12 建独立 venv 装 Style-Bert-VITS2（约 400MB）。"""
+        if self._model_busy:
+            return
+        self._model_busy = True
+        self.home.set_model_state("正在安装语音运行时…", busy=True, done=0, total=1)
+
+        def progress(text: str) -> None:
+            self.bridge.home_progress.emit("runtime", text, 0, 1)
+
+        def work() -> None:
+            try:
+                tts_runtime.install(on_log=progress)
+                self.bridge.home_done.emit("runtime", True, "语音运行时已就绪")
+            except Exception as e:  # noqa: BLE001
+                log.exception("安装语音运行时失败")
+                self.bridge.home_done.emit("runtime", False, str(e))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1462,16 +1491,34 @@ class App:
                 done += len(chunk)
                 progress(dest.name, done, max(total, done))
 
+    def _show_runtime_error(self, message: str) -> None:
+        """运行时装失败（多半是没装 Python 3.12）：给一条直接去下载的路。"""
+        box = QMessageBox(self.home)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("语音运行时")
+        box.setText("语音运行时没能装好")
+        box.setInformativeText(message)
+        open_btn = box.addButton("打开 Python 下载页", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl(tts_runtime.PYTHON_DOWNLOAD_URL))
+
     def _on_home_progress(self, kind: str, text: str, done: int, total: int) -> None:
         if kind == "model":
             self.home.set_model_state(text, primary="下载", busy=True, done=done, total=total)
+        elif kind == "runtime":
+            self.home.set_model_state(text, primary="安装运行时", busy=True, done=0, total=1)
         elif kind == "cable":
             self.home.set_cable_state(text, primary="下载安装", busy=True, done=done, total=total)
 
     def _on_home_done(self, kind: str, ok: bool, message: str) -> None:
-        if kind == "model":
+        if kind in ("model", "runtime"):
             self._model_busy = False
-            self._notify("语音模型", message, warning=not ok)
+            if kind == "runtime" and not ok:
+                self._show_runtime_error(message)
+            else:
+                self._notify("语音运行时" if kind == "runtime" else "语音模型", message, warning=not ok)
             self._refresh_resources()
         elif kind == "cable":
             self._cable_busy = False
