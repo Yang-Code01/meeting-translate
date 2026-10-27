@@ -39,23 +39,45 @@ class ModelMissing(Exception):
 
 class AsrEngine(Protocol):
     partial_interval: float  # 部分识别的最小间隔（秒）
+    language: str  # 引擎配置的识别语言；auto 表示由模型自动判断
 
     def decode(self, samples: np.ndarray) -> str: ...
+
+    def decode_result(self, samples: np.ndarray) -> tuple[str, str]: ...
 
 
 class _OfflineEngine:
     def __init__(self, rec: sherpa_onnx.OfflineRecognizer, post: Callable[[str], str] | None = None,
-                 partial_interval: float = PARTIAL_INTERVAL) -> None:
+                 partial_interval: float = PARTIAL_INTERVAL, language: str = "ja") -> None:
         self._rec = rec
         self._post = post
         self.partial_interval = partial_interval
+        self.language = language
 
     def decode(self, samples: np.ndarray) -> str:
+        return self.decode_result(samples)[0]
+
+    def decode_result(self, samples: np.ndarray) -> tuple[str, str]:
         s = self._rec.create_stream()
         s.accept_waveform(SAMPLE_RATE, samples)
         self._rec.decode_stream(s)
         text = s.result.text.strip()
-        return self._post(text) if self._post else text
+        if self._post:
+            text = self._post(text)
+        raw = getattr(s.result, "lang", "") or ""
+        return text, normalize_language(raw, self.language)
+
+
+def normalize_language(value: str | None, default: str = "ja") -> str:
+    """SenseVoice 的 lang 可能是 `<|zh|>`；统一成 zh/ja/en，未知时用默认值。"""
+    v = (value or "").strip().strip("<|>").lower()
+    if v.startswith("zh"):
+        return "zh"
+    if v.startswith("ja"):
+        return "ja"
+    if v.startswith("en"):
+        return "en"
+    return "" if default == "auto" else default
 
 
 _CJK_SPACE = re.compile(r"\s+(?=[^\x00-\x7f])|(?<=[^\x00-\x7f])\s+")
@@ -86,7 +108,7 @@ def _reazon(hotwords: list[str], threads: int) -> AsrEngine:
             hotwords_score=2.0,
             modeling_unit="cjkchar",
         )
-    return _OfflineEngine(sherpa_onnx.OfflineRecognizer.from_transducer(**kw))
+    return _OfflineEngine(sherpa_onnx.OfflineRecognizer.from_transducer(**kw), language="ja")
 
 
 def whisper_dir_name(size: str) -> str:
@@ -125,7 +147,7 @@ def _sensevoice(threads: int, language: str) -> AsrEngine:
     rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
         model=str(d / "model.int8.onnx"), tokens=str(d / "tokens.txt"), num_threads=threads, language=language, use_itn=True
     )
-    return _OfflineEngine(rec, strip_cjk_spaces)
+    return _OfflineEngine(rec, strip_cjk_spaces, language=language)
 
 
 def _whisper(size: str, threads: int) -> AsrEngine:
@@ -136,7 +158,7 @@ def _whisper(size: str, threads: int) -> AsrEngine:
     rec = sherpa_onnx.OfflineRecognizer.from_whisper(
         encoder=enc, decoder=dec, tokens=tok, language="ja", task="transcribe", num_threads=threads
     )
-    return _OfflineEngine(rec)
+    return _OfflineEngine(rec, language="ja")
 
 
 def create_engine(name: str, hotwords: list[str], threads: int, language: str = "ja") -> AsrEngine:
@@ -157,6 +179,9 @@ class Final:
     ja: str
     wall_time: float
     mono_time: float
+    lang: str = ""  # zh | ja | en；空 = 未知
+    direction: str | None = None  # ja-zh | zh-ja；双向会议时逐条携带
+    audio: np.ndarray | None = None  # 16k 单声道，供同语言直通/调试
 
 
 class _Segmenter:
@@ -179,9 +204,10 @@ class _Segmenter:
         self._pre_roll: deque[np.ndarray] = deque(maxlen=int(PRE_ROLL_SECONDS * SAMPLE_RATE / 1600) + 1)
         self._buf: list[np.ndarray] = []
         self._last_partial = 0.0
+        self._speaking = False
 
-    def feed(self, samples: np.ndarray) -> tuple[np.ndarray | None, list[np.ndarray]]:
-        """返回 (需要做部分识别的音频, 已定稿的句子音频列表)。部分识别音频为 None 表示本次不需要。"""
+    def feed(self, samples: np.ndarray) -> tuple[np.ndarray | None, list[np.ndarray], bool]:
+        """返回 (需要部分识别的音频, 已定稿的句子音频列表, 本次是否刚开始说话)。"""
         self._vad.accept_waveform(samples)
         finals: list[np.ndarray] = []
         while not self._vad.empty():
@@ -190,8 +216,11 @@ class _Segmenter:
         if finals:
             self._buf.clear()
 
+        speech = self._vad.is_speech_detected()
+        started = speech and not self._speaking
+        self._speaking = speech
         partial = None
-        if self._vad.is_speech_detected():
+        if speech:
             if not self._buf:
                 self._buf.extend(self._pre_roll)
             self._buf.append(samples)
@@ -202,9 +231,10 @@ class _Segmenter:
         else:
             self._buf.clear()
         self._pre_roll.append(samples)
-        return partial, finals
+        return partial, finals, started
 
     def flush(self) -> list[np.ndarray]:
+        self._speaking = False
         self._vad.flush()
         out = []
         while not self._vad.empty():
@@ -232,11 +262,13 @@ class AsrWorker:
         on_partial: Callable[[str, str], None],
         on_final: Callable[[Final], None],
         silence_seconds: float = 0.6,
+        on_speech_start: Callable[[str], None] | None = None,
     ) -> None:
         self._engine = engine
         self._segs = {s: _Segmenter(s, max_seconds, silence_seconds, engine.partial_interval) for s in sources}
         self._on_partial = on_partial
         self._on_final = on_final
+        self._on_speech_start = on_speech_start
         self._q: queue.Queue[tuple[str, np.ndarray | None] | None] = queue.Queue()
         self._recent: deque[tuple[str, str, float]] = deque(maxlen=20)
         self._ids = itertools.count(1)
@@ -274,7 +306,9 @@ class AsrWorker:
             # 积压时跳过部分识别，优先保证定稿
             backlog = self._q.qsize() > 5
             try:
-                partial, finals = self._segs[source].feed(samples)
+                partial, finals, started = self._segs[source].feed(samples)
+                if started and self._on_speech_start is not None:
+                    self._on_speech_start(source)
                 for seg in finals:
                     self._emit_final(source, seg)
                 if partial is not None and not backlog:
@@ -288,7 +322,12 @@ class AsrWorker:
                 self._emit_final(source, audio)
 
     def _emit_final(self, source: str, audio: np.ndarray) -> None:
-        text = self._engine.decode(audio)
+        decode_result = getattr(self._engine, "decode_result", None)
+        if decode_result is not None:
+            text, lang = decode_result(audio)
+        else:  # 兼容只实现 decode 的旧引擎/测试替身
+            text = self._engine.decode(audio)
+            lang = getattr(self._engine, "language", "")
         self._on_partial(source, "")
         if not text:
             return
@@ -297,7 +336,7 @@ class AsrWorker:
             log.info("丢弃疑似回声: %s", text)
             return
         self._recent.append((source, _norm(text), now))
-        self._on_final(Final(next(self._ids), source, text, time.time(), now))
+        self._on_final(Final(next(self._ids), source, text, time.time(), now, lang=lang, audio=audio))
 
     def _is_echo(self, text: str, now: float) -> bool:
         n = _norm(text)

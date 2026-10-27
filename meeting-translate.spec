@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from copilot._cli_download import ensure_runtime_wrapper
-from PyInstaller.utils.hooks import collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 ROOT = Path(SPECPATH)
 runtime_dir = Path(ensure_runtime_wrapper()).parent  # %LOCALAPPDATA%\github-copilot-sdk\cli\<ver>\prebuilds\win32-x64
@@ -11,7 +11,9 @@ runtime_dir = Path(ensure_runtime_wrapper()).parent  # %LOCALAPPDATA%\github-cop
 datas = [
     (str(ROOT / "models"), "models"),
     (str(runtime_dir), "copilot_runtime"),
+    (str(ROOT / "assets"), "assets"),
 ]
+datas += collect_data_files("sounddevice")
 binaries = collect_dynamic_libs("sherpa_onnx")
 
 a = Analysis(
@@ -19,7 +21,7 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["copilot.generated.rpc"],
+    hiddenimports=["copilot.generated.rpc", "comtypes.gen", "pycaw"],
     excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtQml", "PySide6.QtQuick"],
     noarchive=False,
 )
@@ -31,6 +33,7 @@ exe = EXE(
     a.datas,
     [],
     name="MeetingTranslate",
+    icon=str(ROOT / "assets" / "app.ico"),
     console=False,
     upx=False,
     runtime_tmpdir=None,

@@ -20,6 +20,7 @@ _MD_TITLE = re.compile(r"^# 会议记录 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
 _MD_USAGE = re.compile(r"^> 本场用量：([\d.]+) AIC（模型 (.*)）")
 _MD_USAGE_TOKENS = re.compile(r"^> 本场用量：([\d,]+) 输入 / ([\d,]+) 输出 token（模型 (.*)）")
 _MD_DIRECTION = re.compile(r"^> 翻译方向：(\S+)")
+_MD_MODE = re.compile(r"^> 模式：中日双向同传")
 _MD_ENTRY = re.compile(r"^- `(\d{2}:\d{2}:\d{2})` 【(.+?)】(.*?)\s*$")
 _MD_ZH = re.compile(r"^  → (.*)$")
 _STEM_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{6})")
@@ -33,6 +34,9 @@ class Entry:
     ja: str
     zh: str | None = None
     asr_raw: str | None = None  # LLM 校正前的识别原文（未校正为 None）
+    direction: str | None = None  # ja-zh | zh-ja；双向会议时逐条记录
+    src_lang: str | None = None  # zh | ja | en ...
+    dst_lang: str | None = None
 
 
 class Transcript:
@@ -78,6 +82,8 @@ class Transcript:
         for line in lines[1:]:
             if m := _MD_DIRECTION.match(line):
                 t.direction = lang.from_label(m.group(1))
+            elif _MD_MODE.match(line):
+                t.direction = "bi"
             elif m := _MD_USAGE_TOKENS.match(line):
                 t.usage_tokens = (int(m.group(1).replace(",", "")), int(m.group(2).replace(",", "")))
                 t.models = [x.strip() for x in m.group(3).split(",") if x.strip() and x.strip() != "—"]
@@ -89,7 +95,19 @@ class Transcript:
                 if ts < started.replace(second=0):  # 跨午夜
                     day = day + timedelta(days=1)
                     ts = ts + timedelta(days=1)
-                last = Entry(len(t.entries) + 1, ts.timestamp(), m.group(2), m.group(3))
+                source = m.group(2)
+                entry_direction = None
+                if "·" in source:
+                    source, label = source.split("·", 1)
+                    entry_direction = lang.from_label(label)
+                elif t.direction == "bi":
+                    entry_direction = lang.ZH_JA if source == "我" else lang.JA_ZH
+                last = Entry(
+                    len(t.entries) + 1, ts.timestamp(), source, m.group(3),
+                    direction=entry_direction,
+                    src_lang="zh" if entry_direction == lang.ZH_JA else "ja",
+                    dst_lang="ja" if entry_direction == lang.ZH_JA else "zh",
+                )
                 t._add(last)
             elif last is not None and (m := _MD_ZH.match(line)):
                 zh = m.group(1)
@@ -102,6 +120,9 @@ class Transcript:
         self._by_id[e.id] = e
 
     def add(self, e: Entry) -> None:
+        if e.direction and not e.src_lang:
+            e.src_lang = "zh" if e.direction == lang.ZH_JA else "ja"
+            e.dst_lang = "ja" if e.direction == lang.ZH_JA else "zh"
         with self._lock:
             self._add(e)
         self.save()
@@ -131,17 +152,25 @@ class Transcript:
                     e.ja = corrected
         self.save()
 
-    def since(self, wall_time: float) -> list[Entry]:
+    def since(self, wall_time: float, direction: str | None = None) -> list[Entry]:
         with self._lock:
-            return [e for e in self.entries if e.wall_time >= wall_time]
+            items = [e for e in self.entries if e.wall_time >= wall_time]
+            if direction is not None:
+                items = [e for e in items if (e.direction or self.direction) == direction]
+            return items
 
-    def last(self, n: int) -> list[Entry]:
+    def last(self, n: int, direction: str | None = None) -> list[Entry]:
         with self._lock:
-            return [e for e in self.entries if e.zh][-n:]
+            items = [e for e in self.entries if e.zh]
+            if direction is not None:
+                items = [e for e in items if (e.direction or self.direction) == direction]
+            return items[-n:]
 
     def to_markdown(self) -> str:
         lines = [f"# 会议记录 {self.started:%Y-%m-%d %H:%M}", ""]
-        if self.direction != lang.JA_ZH:
+        if self.direction == "bi":
+            lines += ["> 模式：中日双向同传", ""]
+        elif self.direction != lang.JA_ZH:
             lines += [f"> 翻译方向：{lang.get(self.direction).label}", ""]
         if self.usage_tokens:
             tin, tout = self.usage_tokens
@@ -153,7 +182,11 @@ class Transcript:
             lines += [f"> 本场用量：{fmt_aic(self.usage_aic)} AIC（模型 {', '.join(self.models) or '—'}）", ""]
         for e in self.entries:
             ts = datetime.fromtimestamp(e.wall_time).strftime("%H:%M:%S")
-            lines.append(f"- `{ts}` 【{e.source}】{e.ja}  ")
+            if e.direction:
+                d = lang.get(e.direction)
+                lines.append(f"- `{ts}` 【{e.source}·{d.label}】{e.ja}  ")
+            else:
+                lines.append(f"- `{ts}` 【{e.source}】{e.ja}  ")
             lines.append(f"  → {'—' if e.zh == '' else (e.zh or '（未翻译）')}")
         return "\n".join(lines) + "\n"
 

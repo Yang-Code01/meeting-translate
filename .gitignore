@@ -27,6 +27,12 @@ spikes/
 
 # 本地设计截图、临时脚本与状态（不公开）
 .local/
+.scratch/
+.smoke/
+
+# 本机自动化/快捷方式产物
+@AutomationLog.txt
+*.lnk
 
 # 误由未展开的 %SystemDrive% 生成的 Windows 缓存副本
 %SystemDrive%/
