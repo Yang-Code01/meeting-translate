@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from meeting_translate import lang
+from meeting_translate import config, lang, transcript
 from meeting_translate.app import App
 from meeting_translate.asr import ME, THEM
 from meeting_translate.joiner import Pending
 from meeting_translate.transcript import Entry, Transcript
+
+
+@pytest.fixture(autouse=True)
+def isolated_transcripts(tmp_path, monkeypatch):
+    """Transcript 默认写到 %APPDATA%/meeting-translate/transcripts。
+
+    这些用例用 App.__new__ 跳过 __init__，不会建目录：CI 上没有该目录就直接
+    FileNotFoundError，本地则会把测试条目写进真实会议记录。统一指到 tmp_path。
+    """
+    target = tmp_path / "transcripts"
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(transcript, "TRANSCRIPT_DIR", target)
+    monkeypatch.setattr(config, "TRANSCRIPT_DIR", target)
+    return target
 
 
 class FakeOverlay:
