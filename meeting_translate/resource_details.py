@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 
 from . import tts_runtime
 from .duplex_audio import CableDevices
-from .tts_models import download_groups, human_size, total_download_text
+from .tts_models import HF_MIRROR, HF_OFFICIAL, SBV2_ONNX_DEFAULT_URL, download_groups, human_size, total_download_text
 
 DETAIL_QSS = """
 QDialog#detailDialog { background: #0f1115; }
@@ -122,11 +122,26 @@ def models_html(root: Path | str) -> str:
     ]
     return (
         _para(
+            "<span style='color:#e0a45c'>只有「03 语音实时转译」（以及试一句、自检）需要语音模型</span>；"
+            "「01 会议实时翻译」和「02 划词翻译」不用下载这些。"
+        )
+        + _para(
             f"首次安装要下载三组文件，合计约 <b style='color:#eaf0fb'>{total_download_text()}</b>，"
-            "卡片上的「下载」一次装齐。"
+            "点卡片上的「下载」会打开下载列表，运行时和三组模型各一行，可逐项下载，也可「全部下载」；"
+            "已下好的文件会按大小与 SHA256 跳过，只补缺的。"
         )
         + _para(f"安装位置：<span {_CODE}>{html.escape(_short_path(root))}</span>")
         + _table(["方向", "模型 / 来源 / 明细", "大小"], rows, ["14%", "72%", "14%"])
+        + _heading("从哪里下载")
+        + _list(
+            [
+                f"MeloTTS、SBV2 配置、日文 BERT：先走 HuggingFace 国内镜像 <span {_CODE}>{HF_MIRROR}</span>，"
+                f"失败再走官方 <span {_CODE}>{HF_OFFICIAL}</span>。",
+                f"SBV2 的 ONNX 权重：本项目 GitHub release <span {_CODE}>tts-models-v1</span>"
+                f"（<span {_CODE}>{html.escape(SBV2_ONNX_DEFAULT_URL)}</span>）。",
+                "每个文件下完都核对大小与 SHA256，不对就删掉重下。",
+            ]
+        )
         + _heading("两个方向各用哪一组")
         + _list(
             [
@@ -147,21 +162,34 @@ def models_html(root: Path | str) -> str:
         + _heading("还要一个 Python 运行时（首次 约 400MB）")
         + _para(
             "Style-Bert-VITS2 要求 <span " + _CODE + ">numpy&lt;2</span>，而主程序跑在 numpy 2 上，"
-            "两个约束装不进同一个解释器，所以程序会在你的机器上用 <b>Python 3.12</b> 建一个独立环境，"
-            "只装 onnxruntime（约 70MB）和几个纯 Python 依赖。卡片上的「安装运行时」就干这件事。"
+            "两个约束装不进同一个解释器，所以程序会用 <b>Python 3.12</b> 建一个独立环境，"
+            "只装 onnxruntime（约 70MB）和几个纯 Python 依赖。下载列表里的「语音运行时」一行就干这件事。"
         )
         + _list(
             [
-                "需要机器上装有 Python 3.12（3.13/3.14 目前还没有 numba、llvmlite 的轮子）。",
-                "没有的话点「安装运行时」会提示，并给一个 python.org 的下载链接。",
+                "先检测再下载：PATH 上有 uv 就直接用；没有 uv 再找系统里的 Python 3.12；都没有时自动下载 uv。",
+                "只能是 3.12：<span " + _CODE + ">numpy&lt;2</span> 与 pyopenjtalk-dict 都没有 3.13/3.14 的轮子。",
                 f"装好的环境在 <span {_CODE}>{html.escape(_short_path(tts_runtime.runtime_dir()))}</span>，"
                 "想重装直接删掉这个目录再点一次。",
+            ]
+        )
+        + _heading("运行时从哪里下载")
+        + _list(
+            [
+                f"uv（约 15MB，只在机器上没有时下载）：先从清华 PyPI 镜像取 uv 的 wheel，失败再走 GitHub "
+                f"<span {_CODE}>{html.escape(tts_runtime.UV_GITHUB_URL)}</span>。",
+                f"Python 3.12（约 20MB，由 uv 下载）：npmmirror <span {_CODE}>{tts_runtime.UV_PYTHON_MIRROR}</span>，"
+                "失败再走 uv 官方源。",
+                f"Python 依赖（onnxruntime、numpy 等）：清华 PyPI 镜像 <span {_CODE}>{tts_runtime.PIP_INDEX}</span>。",
+                f"Style-Bert-VITS2：本项目 GitHub release <span {_CODE}>tts-runtime-v1</span>"
+                f"（<span {_CODE}>{html.escape(tts_runtime.WHEEL_NAME)}</span>）。",
             ]
         )
         + _heading("装完以后")
         + _list(
             [
-                "下载完成后卡片变成「已安装 · 启动时加载」，模型随程序启动加载。",
+                "下载完成后卡片变成「运行时与模型已就绪 · 启动时加载」，模型随程序启动加载。",
+                "运行时、模型、虚拟声卡全部就绪后，「03 语音实时转译」的「进入双向同传」才会变为可点。",
                 "开始同传时后台预热两个引擎，避免第一句卡 20 秒。",
                 "想腾出磁盘空间：直接删掉 melo 与 sbv2 两个引擎目录即可（日文 BERT 在 sbv2 目录下，一并删掉）。",
                 "想放到别的盘：设置环境变量 MEETING_TRANSLATE_TTS_DIR 指向新的模型目录。",
@@ -216,6 +244,10 @@ def cable_html(devices: CableDevices | None, downloads: Path | str, error: str =
     ]
     return (
         _para(
+            "<span style='color:#e0a45c'>只有「03 语音实时转译」需要虚拟声卡</span>；"
+            "「01 会议实时翻译」环回采集你的扬声器（默认系统扬声器），「02 划词翻译」不碰音频，都不用装。"
+        )
+        + _para(
             "虚拟声卡用的是 VB-Audio 的虚拟声卡驱动：对会议软件来说它是一块真声卡，对本程序来说是可读写的音频流。"
             "装好后系统里会多出四个端点，A 对收对方声音，B 对送日语。"
         )

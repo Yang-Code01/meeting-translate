@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QProgressBar,
@@ -57,6 +58,11 @@ QPushButton#primary {
     padding: 10px 16px; font-size: 13px; font-weight: 700;
 }
 QPushButton#primary:hover { background: #6a91ff; }
+QPushButton#primary:disabled { color: #6f788c; background: #2a303d; }
+QLabel#modeLock {
+    color: #f0b75a; background: #2a2416; border: 1px solid #4a3d1f;
+    border-radius: 9px; padding: 7px 10px; font-size: 12px;
+}
 QPushButton#ghost {
     color: #dce3f2; background: #202635; border: 1px solid #313a4f;
     border-radius: 10px; padding: 10px 16px; font-size: 13px;
@@ -78,7 +84,83 @@ QProgressBar#cardProgress {
     background: #202838; border: none; border-radius: 3px; max-height: 5px;
 }
 QProgressBar#cardProgress::chunk { background: #5b8cff; border-radius: 3px; }
+QLabel#scopeTag {
+    color: #f0b75a; background: #2a2416; border: 1px solid #4a3d1f;
+    border-radius: 9px; padding: 2px 8px; font-size: 10px; font-weight: 700;
+}
+QLabel#scopeTag:hover { border-color: #f0b75a; }
+QToolTip {
+    color: #dce3f2; background: #1b2030; border: 1px solid #313a4f;
+    padding: 6px 8px; font-size: 12px;
+}
 """
+
+DUPLEX_ONLY_TAG = "语音转换 Only"
+DUPLEX_ONLY_TIP = "仅「03 语音实时转译」需要。\n只用「01 会议实时翻译」「02 划词翻译」不必下载、安装或配置。"
+
+SLOGANS = (
+    "言通中日，语达八方。",
+    "一言既出，两国皆闻。",
+    "耳聪目明，天堑咫尺。",
+    "天涯若比邻，异语亦同声。",
+    "听其言，知其意，传其声。",
+    "言语无隔，心意相通。",
+    "信达雅，弹指间。",
+    "千里之会，如在一室。",
+    "书同文，语同声。",
+    "不费吹灰之力，而通异邦之语。",
+)
+
+
+class SloganLabel(QLabel):
+    """主页大标题：几条标语定时淡出淡入轮换；窗口隐藏时停表。"""
+
+    def __init__(self, slogans: tuple[str, ...] = SLOGANS, interval_ms: int = 4500, parent: QWidget | None = None) -> None:
+        super().__init__(slogans[0], parent)
+        self._slogans = slogans
+        self._index = 0
+        self._fading_out = False
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._effect)
+        self._fade = QPropertyAnimation(self._effect, b"opacity", self)
+        self._fade.setDuration(350)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.finished.connect(self._on_fade_finished)
+        self._timer = QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._fade_out)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._timer.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._timer.stop()
+        self._fade.stop()
+        self._fading_out = False
+        self._effect.setOpacity(1.0)
+
+    def advance(self) -> None:
+        self._index = (self._index + 1) % len(self._slogans)
+        self.setText(self._slogans[self._index])
+
+    def _fade_out(self) -> None:
+        if self._fade.state() == QPropertyAnimation.State.Running:
+            return
+        self._fading_out = True
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.start()
+
+    def _on_fade_finished(self) -> None:
+        if self._fading_out:
+            self._fading_out = False
+            self.advance()
+            self._fade.setStartValue(0.0)
+            self._fade.setEndValue(1.0)
+            self._fade.start()
 
 
 class ModeCard(QFrame):
@@ -146,6 +228,12 @@ class ModeCard(QFrame):
         lay.addSpacing(2)
         lay.addWidget(bullet_lbl)
         lay.addStretch(1)
+        # 前置依赖没装好时，在按钮上方说明缺什么；按钮置灰
+        self._lock = QLabel("")
+        self._lock.setObjectName("modeLock")
+        self._lock.setWordWrap(True)
+        self._lock.hide()
+        lay.addWidget(self._lock)
         if self._button is not None:
             lay.addWidget(self._button)
         elif self._hotkey is not None:
@@ -166,6 +254,18 @@ class ModeCard(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
 
+    def set_locked(self, reason: str) -> None:
+        """reason 非空 = 不可进入：按钮置灰并显示原因。点卡片仍会发 activated，由上层弹提示。"""
+        self._lock.setText(reason)
+        self._lock.setVisible(bool(reason))
+        if self._button is not None:
+            self._button.setEnabled(not reason)
+            self._button.setToolTip(reason)
+
+    @property
+    def locked(self) -> bool:
+        return bool(self._lock.text())
+
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton:
             self.activated.emit()
@@ -184,6 +284,7 @@ class ResourceCard(QFrame):
         *,
         primary: str = "",
         secondary: str = "",
+        duplex_only: bool = False,
     ) -> None:
         super().__init__()
         self.setObjectName("resourceCard")
@@ -223,14 +324,21 @@ class ResourceCard(QFrame):
         row.addWidget(self.btn_primary)
         row.addWidget(self.btn_secondary)
         row.addStretch(1)
+        # 右下角角标：只有「03 语音实时转译」才用得到，悬停看说明
+        self.scope_tag: QLabel | None = None
+        if duplex_only:
+            self.scope_tag = QLabel(DUPLEX_ONLY_TAG)
+            self.scope_tag.setObjectName("scopeTag")
+            self.scope_tag.setToolTip(DUPLEX_ONLY_TIP)
+            row.addWidget(self.scope_tag, 0, Qt.AlignmentFlag.AlignBottom)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 11, 14, 11)
         lay.setSpacing(4)
         lay.addLayout(head)
         lay.addWidget(desc)
         lay.addWidget(self.progress)
-        lay.addLayout(row)
         lay.addStretch(1)
+        lay.addLayout(row)
 
     def set_state(
         self,
@@ -241,25 +349,28 @@ class ResourceCard(QFrame):
         busy: bool = False,
         done: int = 0,
         total: int = 0,
+        keep_buttons: bool = False,
     ) -> None:
+        """keep_buttons=True：显示进度的同时按钮仍可点（如「查看进度」）。"""
         self.status.setText(status)
         self.status.setToolTip(status)
+        locked = busy and not keep_buttons
         if primary is not None:
             self._primary_key = primary
             self.btn_primary.setText(primary)
             self.btn_primary.setVisible(bool(primary))
-            self.btn_primary.setEnabled(bool(primary) and not busy)
+            self.btn_primary.setEnabled(bool(primary) and not locked)
         if secondary is not None:
             self._secondary_key = secondary
             self.btn_secondary.setText(secondary)
             self.btn_secondary.setVisible(bool(secondary))
-            self.btn_secondary.setEnabled(not busy)
+            self.btn_secondary.setEnabled(not locked)
         self.progress.setVisible(busy)
         if busy:
             self.progress.setRange(0, max(1, total))
             self.progress.setValue(max(0, done))
-        self.btn_primary.setEnabled(not busy and bool(self.btn_primary.text()))
-        self.btn_secondary.setEnabled(not busy and bool(self.btn_secondary.text()))
+        self.btn_primary.setEnabled(not locked and bool(self.btn_primary.text()))
+        self.btn_secondary.setEnabled(not locked and bool(self.btn_secondary.text()))
 
 
 class HomeWindow(QWidget):
@@ -331,7 +442,7 @@ class HomeWindow(QWidget):
         header.addWidget(btn_settings)
         header.addWidget(btn_quit)
 
-        question = QLabel("今天要做什么？")
+        question = SloganLabel()
         question.setObjectName("question")
         question_sub = QLabel("三种入口共用同一套模型、术语表与记录目录；进入后可在悬浮窗里开始或结束会话。")
         question_sub.setObjectName("questionSub")
@@ -363,6 +474,7 @@ class HomeWindow(QWidget):
         self.card_meeting.activated.connect(lambda: self.mode_selected.emit("captions"))
         # 划词翻译常驻全局快捷键，不设“开始划词”按钮；卡片只展示快捷键。
         self.card_duplex.activated.connect(lambda: self.mode_selected.emit("duplex"))
+        self.card_duplex.set_locked("正在检测语音模型与虚拟声卡…")
 
         cards = QHBoxLayout()
         cards.setSpacing(16)
@@ -371,9 +483,10 @@ class HomeWindow(QWidget):
 
         self.model_card = ResourceCard(
             "语音模型",
-            f"中文 MeloTTS + 日文 SBV2，约 {total_download_text()}；首次还要装一个 Python 运行时。",
+            f"中文 MeloTTS + 日文 SBV2，约 {total_download_text()}，另需约 400MB 运行时。",
             primary="下载",
             secondary="详细",
+            duplex_only=True,
         )
         self.model_card.setToolTip(download_summary_lines())
         self.cable_card = ResourceCard(
@@ -381,6 +494,7 @@ class HomeWindow(QWidget):
             "CABLE-A 收对方声音，CABLE-B 送日语给对方。",
             primary="下载安装",
             secondary="详细",
+            duplex_only=True,
         )
         self.cable_card.setToolTip(
             "下载 VB-Audio CABLE A+B（VBCABLE_Driver_Pack45）与 Hi-Fi Cable（HiFiCableAsioBridgeSetup）\n"
@@ -389,9 +503,10 @@ class HomeWindow(QWidget):
         )
         self.teams_card = ResourceCard(
             "会议软件配置",
-            "以 Teams 为例：扬声器选 CABLE Input、麦克风选 Hi-Fi Cable Output。Zoom、腾讯会议、Google Meet 同理，只是入口在各自音频设置里。",
+            "以 Teams 为例：扬声器选 CABLE Input、麦克风选 Hi-Fi Cable Output，Zoom、腾讯会议、Google Meet 同理。",
             primary="打开 Teams",
             secondary="配置步骤",
+            duplex_only=True,
         )
         self.model_card.action_requested.connect(self.model_requested)
         self.cable_card.action_requested.connect(self.cable_requested)
@@ -422,14 +537,21 @@ class HomeWindow(QWidget):
         lay.addLayout(footer)
         self.refresh(settings)
 
-    def set_model_state(self, status: str, *, primary: str | None = None, busy: bool = False, done: int = 0, total: int = 0) -> None:
-        self.model_card.set_state(status, primary=primary, busy=busy, done=done, total=total)
+    def set_model_state(
+        self, status: str, *, primary: str | None = None, busy: bool = False, done: int = 0, total: int = 0, keep_buttons: bool = False
+    ) -> None:
+        self.model_card.set_state(status, primary=primary, busy=busy, done=done, total=total, keep_buttons=keep_buttons)
 
     def set_cable_state(self, status: str, *, primary: str | None = None, busy: bool = False, done: int = 0, total: int = 0) -> None:
         self.cable_card.set_state(status, primary=primary, busy=busy, done=done, total=total)
 
     def set_teams_state(self, status: str) -> None:
         self.teams_card.set_state(status)
+
+    def set_duplex_blockers(self, blockers: list[str]) -> None:
+        """「03 语音实时转译」的前置依赖没齐时锁住入口。"""
+        reason = ("需先装好：" + "、".join(blockers) + "（见下方卡片）") if blockers else ""
+        self.card_duplex.set_locked(reason)
 
     def refresh(self, settings: Settings) -> None:
         self.hotkey_label.setText(

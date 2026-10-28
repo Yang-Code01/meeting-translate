@@ -65,7 +65,12 @@ def _find_alias(names: Iterable[str], prefixes: Iterable[str], kind: str) -> str
 
 
 _VIRTUAL_HINTS = ("cable", "vb-audio", "voicemeeter", "virtual", "hi-fi", "hifi")
-_PHYSICAL_HINTS = ("headphone", "headset", "earphone", "hyperx", "耳机", "耳麦")
+_PHYSICAL_HINTS = (
+    "headphone", "headset", "earphone", "hyperx", "耳机", "耳麦",
+    "ヘッドフォン", "ヘッドホン", "ヘッドセット", "イヤホン",
+)
+# 显示器 HDMI/DP 音频多半没接喇叭，只在实在没有别的设备时才用。
+_DISPLAY_HINTS = ("display audio", "hdmi", "displayport", "nvidia high definition", "amd high definition")
 
 
 def _physical_speaker(names: Iterable[str]) -> str | None:
@@ -76,11 +81,11 @@ def _physical_speaker(names: Iterable[str]) -> str | None:
             low = _norm(name)
             if hint in low and not any(v in low for v in _VIRTUAL_HINTS):
                 return name
-    for name in speakers:
-        low = _norm(name)
-        if not any(v in low for v in _VIRTUAL_HINTS):
+    real = [n for n in speakers if not any(v in _norm(n) for v in _VIRTUAL_HINTS)]
+    for name in real:
+        if not any(d in _norm(name) for d in _DISPLAY_HINTS):
             return name
-    return None
+    return real[0] if real else None
 
 
 @dataclass(frozen=True)

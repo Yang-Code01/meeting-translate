@@ -40,6 +40,91 @@ def list_microphones() -> list[str]:
     return [m.name for m in sc.all_microphones(include_loopback=False)]
 
 
+def default_microphone_name() -> str | None:
+    try:
+        return str(sc.default_microphone().name)
+    except Exception:
+        return None
+
+
+_VIRTUAL_HINTS = ("cable", "hi-fi", "vb-audio", "voicemeeter", "virtual")
+
+
+def is_virtual_device(name: str | None) -> bool:
+    """虚拟声卡（VB-Cable/Hi-Fi Cable/Voicemeeter）录到的是别的程序的声音，不是你的嗓子。"""
+    low = (name or "").casefold()
+    return any(h in low for h in _VIRTUAL_HINTS)
+
+
+AUDIO_SERVICE_HELP = (
+    "Windows 音频服务（Windows Audio / Audiosrv）没有运行，所有麦克风和扬声器都不可用。\n\n"
+    "恢复方法（任选其一）：\n"
+    "1. Win+R 输入 services.msc → 找到「Windows Audio」→ 右键「启动」\n"
+    "2. 以管理员身份打开 PowerShell，执行：Start-Service Audiosrv\n"
+    "3. 重启电脑"
+)
+
+
+def audio_service_running() -> bool | None:
+    """Windows Audio 服务是否在运行；查不到（非 Windows/权限异常）返回 None。"""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class _Status(ctypes.Structure):
+        _fields_ = [(n, wintypes.DWORD) for n in (
+            "type", "state", "controls", "exit_code", "svc_exit_code", "checkpoint", "wait_hint")]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.OpenSCManagerW.restype = wintypes.HANDLE
+    advapi.OpenServiceW.restype = wintypes.HANDLE
+    advapi.OpenServiceW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD)
+    advapi.QueryServiceStatus.argtypes = (wintypes.HANDLE, ctypes.POINTER(_Status))
+    advapi.CloseServiceHandle.argtypes = (wintypes.HANDLE,)
+    scm = advapi.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+    if not scm:
+        return None
+    try:
+        svc = advapi.OpenServiceW(scm, "Audiosrv", 0x0004)  # SERVICE_QUERY_STATUS
+        if not svc:
+            return None
+        try:
+            status = _Status()
+            if not advapi.QueryServiceStatus(svc, ctypes.byref(status)):
+                return None
+            return status.state == 4  # SERVICE_RUNNING
+        finally:
+            advapi.CloseServiceHandle(svc)
+    finally:
+        advapi.CloseServiceHandle(scm)
+
+
+# 阻塞读只在 WASAPI/MME 上可用；WDM-KS 会报「Blocking API not supported yet」。
+SD_HOSTAPIS = ("Windows WASAPI", "MME")
+
+
+def pick_sounddevice_input(devices, hostapis, wanted: str | None) -> int | None:
+    """在 WASAPI（优先）/MME 里挑麦克风：先按名称，再取该 API 的默认输入。"""
+    for api_name in SD_HOSTAPIS:
+        api = next((a for a in hostapis if a.get("name") == api_name), None)
+        if api is None:
+            continue
+        members = [i for i in api.get("devices", []) if devices[i]["max_input_channels"] > 0]
+        if wanted:
+            for i in members:
+                if wanted in devices[i]["name"]:
+                    return i
+    for api_name in SD_HOSTAPIS:
+        api = next((a for a in hostapis if a.get("name") == api_name), None)
+        if api is None:
+            continue
+        default = api.get("default_input_device", -1)
+        if default is not None and default >= 0 and devices[default]["max_input_channels"] > 0:
+            return default
+    return None
+
+
 def _loopback(name: str | None):
     spk = sc.get_speaker(name) if name else sc.default_speaker()
     return sc.get_microphone(id=str(spk.name), include_loopback=True)
@@ -138,18 +223,11 @@ class Capture:
             return
 
         try:
-            devices = sd.query_devices()
-            index = None
-            wanted = self._mic_device
-            if wanted:
-                for i, dev in enumerate(devices):
-                    if dev["max_input_channels"] > 0 and wanted in dev["name"]:
-                        index = i
-                        break
+            index = pick_sounddevice_input(sd.query_devices(), sd.query_hostapis(), self._mic_device)
             if index is None:
-                index = sd.default.device[0]
-            if index is None or index < 0:
-                raise RuntimeError("没有可用的默认麦克风")
+                if audio_service_running() is False:
+                    raise RuntimeError("Windows 音频服务未运行")
+                raise RuntimeError("没有可用的麦克风（WASAPI/MME 下都找不到输入设备）")
 
             rate = None
             for candidate in (48000, 44100, 16000):

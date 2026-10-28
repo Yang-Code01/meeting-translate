@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import dataclasses
 import itertools
 import logging
 import os
@@ -16,14 +17,17 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtCore import QProcess
 
 from . import duplex_audio, glossary, lang, qtcom, stats, tts_runtime
+from . import message_dialog as msg
 from .asr import AsrEngine, AsrWorker, Final, ModelMissing, create_engine
-from .audio import ME, THEM, Capture
+from .audio import AUDIO_SERVICE_HELP, ME, THEM, Capture, audio_service_running
+from .audio import is_virtual_device as audio_is_virtual
 from .config import (
+    APP_DIR,
     GLOSSARY_FILE,
     LOG_FILE,
     SELECTION_HISTORY_FILE,
@@ -33,13 +37,14 @@ from .config import (
     ensure_dirs,
     use_bundled_runtime,
 )
-from .default_audio import DefaultOutputSwitch, find_output, set_defaults
+from .default_audio import DefaultOutputSwitch, clear_pending, find_output, load_pending, save_pending, set_defaults
 from .duplex_audio import LivePlayer, PassthroughRouter, Player, resolve_devices
 from .duplex_speech import TtsSpeaker
 from .diagnostics import DiagnosticsDialog
 from .home_ui import HomeWindow
 from .hotkey import GlobalHotkey
 from .joiner import Joiner, Pending
+from .model_download_dialog import ModelDownloadDialog, ModelRow
 from .resource_details import DetailDialog, cable_html, models_html
 from .selection import SelectionCapture, SelectionRecord, append_history
 from .providers import make_backend
@@ -47,7 +52,7 @@ from .summarize import summarize
 from .transcript import Entry, Transcript, fmt_aic
 from .translator import AuthState, ModelOption, Quota, Translator
 from .tts_client import TtsClient, TtsError, default_worker_command
-from .tts_models import ModelManager, total_download_text
+from .tts_models import ModelManager, download_groups, human_size
 from .ui import (
     MODEL_LABELS,
     Bridge,
@@ -67,6 +72,7 @@ log = logging.getLogger(__name__)
 IDLE, RUNNING, PAUSED = "idle", "running", "paused"
 QUOTA_INTERVAL_MS = 5 * 60 * 1000
 LOW_QUOTA_PERCENT = 10.0
+PENDING_OUTPUT_FILE = APP_DIR / "pending_output_restore.json"
 
 
 def _icon_path() -> Path:
@@ -166,9 +172,20 @@ class App:
         self.home.quit_requested.connect(self.quit)
         self.bridge.home_progress.connect(self._on_home_progress)
         self.bridge.home_done.connect(self._on_home_done)
-        self.model_manager = ModelManager(Path(MODEL_DIR) / "tts")
+        self.model_manager = ModelManager(Path(os.environ.get("MEETING_TRANSLATE_TTS_DIR") or (MODEL_DIR / "tts")))
+        # 「重新检测」进行中（只防连点，下载任务另记在 _model_jobs）
         self._model_busy = False
         self._cable_busy = False
+        self._runtime_error_code = ""
+        # 虚拟声卡只给「03 语音实时转译」用；本次运行里确认过一次就不再问
+        self._duplex_download_confirmed = False
+        # 03 入口的前置依赖缺什么；None = 还没检测过
+        self._duplex_blockers: list[str] | None = None
+        self._model_dialog: ModelDownloadDialog | None = None
+        # 正在跑的下载，可以同时多项：行 key → {cancel, text, done, total}
+        self._model_jobs: dict[str, dict] = {}
+        # 本次运行里暂停过、还没下完的行
+        self._model_paused: set[str] = set()
         self.selection_popup = SelectionResultPopup()
         self.selection_popup.apply_style(self.settings)
         self.selection_popup.user_resized.connect(self._save_selection_popup_size)
@@ -208,9 +225,18 @@ class App:
         self._passthrough: PassthroughRouter | None = None
         self._audio_switch: DefaultOutputSwitch | None = None
         self._restore_output_name: str | None = None
+        self._shutdown_lock = threading.Lock()
+        self._shut_down = False
+        pending = load_pending(PENDING_OUTPUT_FILE)
+        if pending is not None:
+            # 上次被强杀（关终端/任务管理器）没来得及切回耳机，这里补上。
+            log.info("上次退出未恢复默认输出，现在切回：%s", pending.name)
+            self._restore_output_name = pending.name
+            QTimer.singleShot(0, self._restore_default_output)
         threading.Thread(target=self._preload_engine, daemon=True).start()
         self.home.show()
         self.home.raise_()
+        close_splash()
         QTimer.singleShot(350, self._refresh_resources)
 
     # ---- 基础设施 ----
@@ -256,9 +282,7 @@ class App:
         menu.addSeparator()
         menu.addAction("退出", self.quit)
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(
-            lambda r: self._toggle_overlay() if r == QSystemTrayIcon.ActivationReason.Trigger else None
-        )
+        self.tray.activated.connect(self._on_tray_activated)
         self.tray.messageClicked.connect(lambda: self._last_output and open_path(self._last_output))
         self.tray.show()
         self._tray_menu = menu
@@ -366,8 +390,19 @@ class App:
         self.overlay.ensure_on_screen()
         self.overlay.show()
 
+    def _on_tray_activated(self, reason) -> None:
+        """单击托盘图标：正在会话 / 已进入某个入口时把悬浮框提到前面，否则回主界面。"""
+        if reason != QSystemTrayIcon.ActivationReason.Trigger:
+            return
+        if self.state != IDLE or self.overlay.isVisible():
+            self._show_overlay()
+            self.overlay.raise_()
+            self.overlay.activateWindow()
+        else:
+            self._show_home()
+
     def _toggle_overlay(self) -> None:
-        """托盘/双击托盘图标的临时开关；同步进设置，重启后保持。"""
+        """托盘菜单「显示/隐藏字幕窗」；同步进设置，重启后保持。"""
         self.settings.show_overlay = not self.overlay.isVisible()
         self.settings.save()
         if self.settings.show_overlay:
@@ -391,7 +426,9 @@ class App:
 
     def _on_home_mode(self, mode: str) -> None:
         if self.state != IDLE:
-            QMessageBox.information(self.home, "正在会话", "请先在悬浮窗里结束当前会话，再切换入口。")
+            msg.info(self.home, "正在会话", "请先在悬浮窗里结束当前会话，再切换入口。")
+            return
+        if mode == "duplex" and not self._duplex_ready(self.home):
             return
         self.settings.meeting_mode = "duplex" if mode == "duplex" else "captions"
         self.settings.show_overlay = True
@@ -496,18 +533,18 @@ class App:
             result = append_history(SELECTION_HISTORY_FILE, self._pending_selection_history)
         except (OSError, UnicodeError) as e:
             log.exception("保存划词翻译历史失败")
-            QMessageBox.warning(parent, "保存失败", f"无法写入历史文件：{e}")
+            msg.warn(parent, "保存失败", f"无法写入历史文件：{e}")
             return
         self._pending_selection_history.clear()
         if not (result.added or result.skipped or result.cleaned):
-            QMessageBox.information(parent, "翻译历史", "当前没有待保存的划词翻译记录，历史文件中也没有重复。")
+            msg.info(parent, "翻译历史", "当前没有待保存的划词翻译记录，历史文件中也没有重复。")
             return
         details = [f"新增 {result.added} 条记录"]
         if result.skipped:
             details.append(f"跳过重复 {result.skipped} 条")
         if result.cleaned:
             details.append(f"清理文件中已有重复 {result.cleaned} 条")
-        QMessageBox.information(
+        msg.info(
             parent,
             "保存成功",
             "，".join(details) + f"。\n{SELECTION_HISTORY_FILE}",
@@ -570,6 +607,14 @@ class App:
         if not self.auth.ok:
             self._show_login(self.auth.message)
             return
+        if audio_service_running() is False:
+            msg.warn(self.overlay if self.overlay.isVisible() else self.home, "Windows 音频服务未运行", AUDIO_SERVICE_HELP)
+            self._set_status("Windows 音频服务未运行")
+            return
+        # 上次停在「03」、之后依赖被删掉的情况：用快捷键开始也要拦住
+        if self.settings.meeting_mode == "duplex" and not self._duplex_ready(self.overlay):
+            self._set_status("语音实时转译的依赖没装好")
+            return
         terms = glossary.load()
         try:
             self._set_status("加载识别模型…")
@@ -577,9 +622,9 @@ class App:
             self._engine_for(terms)
         except ModelMissing as e:
             label = MODEL_LABELS.get(e.name)
-            if label and QMessageBox.question(
-                self.overlay, "需要下载模型", f"{label} 模型尚未下载，现在从 hf-mirror 下载吗？"
-            ) == QMessageBox.StandardButton.Yes:
+            if label and msg.ask(
+                self.overlay, "需要下载模型", f"{label} 模型尚未下载，现在从 hf-mirror 下载吗？", yes="下载", no="取消"
+            ):
                 download_model(e.name, self.overlay, lambda ok: ok and self.start_meeting())
             else:
                 self._set_status(f"缺少模型：{e.name}")
@@ -594,7 +639,7 @@ class App:
                 return
             if self._duplex_devices.missing:
                 missing = "、".join(self._duplex_devices.missing)
-                QMessageBox.warning(
+                msg.warn(
                     self.overlay,
                     "缺少虚拟声卡",
                     f"双向同传需要 VB-Cable A+B，当前缺少：{missing}。\n"
@@ -602,6 +647,21 @@ class App:
                 )
                 self._set_status(f"缺少虚拟声卡：{missing}")
                 return
+            local = self._duplex_devices.local_speaker
+            if audio_is_virtual(local):
+                physical = duplex_audio._physical_speaker(duplex_audio.audio.list_speakers())
+                if physical and msg.ask(
+                    self.overlay if self.overlay.isVisible() else self.home,
+                    "本地耳机选成了虚拟声卡",
+                    f"「本地耳机（中文 TTS）」现在是 {local}。\n"
+                    "这是虚拟声卡，中文译音和「试听日语」会送进会议软件，你自己听不到。\n\n"
+                    f"改用 {physical} 吗？（会同时改掉设置里的这一项）",
+                    yes="改用耳机",
+                    no="保持不变",
+                ):
+                    s.duplex_local_speaker = physical
+                    s.save()
+                    self._duplex_devices = dataclasses.replace(self._duplex_devices, local_speaker=physical)
         else:
             self._duplex_devices = None
         self.transcript = Transcript(direction="bi" if duplex else s.direction)
@@ -785,6 +845,7 @@ class App:
             self._notify("默认输出无需切换", f"系统默认输出已经是：{result.target.name}")
             return
         self._audio_switch = switch
+        save_pending(PENDING_OUTPUT_FILE, result.previous)
         previous = result.previous.name if result.previous else "未知"
         self._set_status(f"默认输出已切到 {result.target.name}")
         self._notify(
@@ -792,7 +853,7 @@ class App:
             f"已切到：{result.target.name}\n原输出：{previous}\n结束双向同传后会自动切回。",
         )
 
-    def _restore_default_output(self) -> None:
+    def _restore_default_output(self, notify: bool = True) -> None:
         switch, self._audio_switch = self._audio_switch, None
         fallback, self._restore_output_name = self._restore_output_name, None
         if switch is None and not fallback:
@@ -808,9 +869,12 @@ class App:
                 restored = dev
         except Exception as e:
             log.warning("恢复默认输出失败：%s", e)
-            self._notify("默认输出未恢复", f"请手动切回耳机：{e}", warning=True)
+            if notify:
+                self._notify("默认输出未恢复", f"请手动切回耳机：{e}", warning=True)
             return
         if restored is not None:
+            clear_pending(PENDING_OUTPUT_FILE)
+        if restored is not None and notify:
             self._set_status(f"默认输出已恢复：{restored.name}")
             self._notify("默认输出已恢复", f"已切回：{restored.name}")
 
@@ -836,7 +900,7 @@ class App:
                     )
                 if not tts_runtime.is_ready():
                     raise TtsError(
-                        "日语语音合成需要先装语音运行时（首页「语音模型」卡 → 安装运行时，需机器上有 Python 3.12）",
+                        "日语语音合成需要先装语音运行时（首页「语音模型」卡 → 下载 → 语音运行时）",
                         "runtime_missing",
                     )
                 client = TtsClient(default_worker_command(root, "auto"))
@@ -951,14 +1015,14 @@ class App:
             return
         # 悬浮窗置顶会盖住确认框，会议结束后先收起
         self.overlay.hide()
-        box = QMessageBox()
-        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        box.setWindowIcon(_icon())
-        box.setWindowTitle("会后整理")
-        box.setText(f"会议已结束（{len(t.entries)} 句）。现在整理纪要、待办和清洗后的双语全文吗？")
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        box.setDefaultButton(QMessageBox.StandardButton.Yes)
-        want = box.exec() == QMessageBox.StandardButton.Yes
+        want = msg.ask(
+            None,
+            "会后整理",
+            f"会议已结束（{len(t.entries)} 句）。现在整理纪要、待办和清洗后的双语全文吗？",
+            yes="整理",
+            no="不用了",
+            on_top=True,
+        )
         self._store_transcript(t)
         if want:
             self._run_summary(t)
@@ -991,7 +1055,7 @@ class App:
             t.move_markdown(folder)
         except OSError as e:
             log.exception("保存会议记录失败")
-            QMessageBox.warning(None, "保存失败", f"无法写入 {folder}：{e}\n记录已保留在 {t.md_path.parent}")
+            msg.warn(None, "保存失败", f"无法写入 {folder}：{e}\n记录已保留在 {t.md_path.parent}")
 
     def _run_summary(self, t: Transcript) -> None:
         self._busy = True
@@ -1019,7 +1083,7 @@ class App:
         # 关掉了，隐藏的父窗口会让原生对话框一起藏起来，界面看着就像卡死了。
         owner = self._settings_dlg or (self.overlay if self.overlay.isVisible() else None)
         if self._busy or self.state != IDLE:
-            QMessageBox.information(owner, "会后整理", "请先结束当前会议。")
+            msg.info(owner, "会后整理", "请先结束当前会议。")
             return
         start = self._save_dir() or TRANSCRIPT_DIR
         path, _ = QFileDialog.getOpenFileName(owner, "选择会议记录", str(start), "会议记录 (*.md)")
@@ -1031,7 +1095,7 @@ class App:
             if not t.entries:
                 raise ValueError("没有解析到任何发言")
         except (OSError, ValueError) as e:
-            QMessageBox.warning(owner, "会后整理", f"无法读取会议记录：{e}")
+            msg.warn(owner, "会后整理", f"无法读取会议记录：{e}")
             return
         self._run_summary(t)
 
@@ -1290,7 +1354,7 @@ class App:
 
     def _show_diagnostics(self, tab: int) -> None:
         if self.state != IDLE:
-            QMessageBox.information(self.home, "正在会话", "请先在悬浮窗里结束当前会话，再做自检或试一句。")
+            msg.info(self.home, "正在会话", "请先在悬浮窗里结束当前会话，再做自检或试一句。")
             return
         dlg = DiagnosticsDialog(self.settings, self.home)
         dlg.tabs.setCurrentIndex(tab)
@@ -1302,44 +1366,237 @@ class App:
         """刷新三张资源卡。rescan=True 表示用户手动点了「重新检测」，结果带上时间戳
         （否则检测结果与上次相同，界面上一个像素都不会变，看上去像没生效）。"""
         stamp = f" · {time.strftime('%H:%M:%S')} 检测" if rescan else ""
+        blockers: list[str] = []
         try:
-            missing = self.model_manager.missing("melo", verify_hash=False) + self.model_manager.missing("sbv2", verify_hash=False)
-            if not tts_runtime.is_ready():
+            manager = self.model_manager
+            missing = manager.missing("melo", verify_hash=False) + manager.missing("sbv2", verify_hash=False)
+            need = manager.missing_bytes("melo") + manager.missing_bytes("sbv2")
+            models_text = f"模型缺 {len(missing)} 个文件，约 {human_size(need)}" if missing else "模型已就绪"
+            runtime_ready = tts_runtime.is_ready()
+            if not runtime_ready:
+                blockers.append("语音运行时")
+            if missing:
+                blockers.append("语音模型")
+            if self._model_busy or self._model_jobs:
+                pass  # 下载进行中：卡片由进度回调负责，别把进度条刷掉
+            elif not runtime_ready:
                 # 模型装了也跑不起来：Style-Bert-VITS2 要 numpy<2，得单独一个环境
-                self.home.set_model_state(f"缺语音运行时 · 需要 Python 3.12{stamp}", primary="安装运行时")
+                tool = "检测到 uv" if tts_runtime.find_uv() else "未检测到 uv，可自动下载"
+                self.home.set_model_state(f"缺语音运行时（约 400MB，{tool}）· {models_text}{stamp}", primary="下载")
             elif missing:
-                self.home.set_model_state(f"未安装 · 约 {total_download_text()}{stamp}", primary="下载")
+                self.home.set_model_state(f"运行时已就绪 · {models_text}{stamp}", primary="下载")
             else:
-                self.home.set_model_state(f"已安装 · 启动时加载{stamp}", primary="")
+                self.home.set_model_state(f"运行时与模型已就绪 · 启动时加载{stamp}", primary="")
         except Exception as e:  # noqa: BLE001
+            blockers.append("语音模型")
             self.home.set_model_state(f"检测失败：{e}", primary="重新检测")
         try:
             devices = duplex_audio.detect_cable_devices()
+            if not devices.complete:
+                blockers.append("虚拟声卡")
             if devices.complete:
                 self.home.set_cable_state(f"已安装 · CABLE-A/B 就绪{stamp}", primary="重新检测")
             else:
                 self.home.set_cable_state("未安装：" + "、".join(devices.missing) + stamp, primary="下载安装")
             self.home.set_teams_state("虚拟声卡就绪，请在会议软件中确认" if devices.complete else "先安装虚拟声卡")
         except Exception as e:  # noqa: BLE001
+            blockers.append("虚拟声卡")
             self.home.set_cable_state(f"检测失败：{e}", primary="重新检测")
             self.home.set_teams_state("虚拟声卡检测失败")
+        self._duplex_blockers = blockers
+        self.home.set_duplex_blockers(blockers)
+        self._update_model_dialog()
+
+    def _duplex_ready(self, parent) -> bool:
+        """进入 / 开始「03 语音实时转译」前现查一次依赖；缺了就弹窗说明并返回 False。"""
+        self._refresh_resources()
+        blockers = self._duplex_blockers or []
+        if not blockers:
+            return True
+        msg.info(
+            parent,
+            "还不能使用语音实时转译",
+            "「03 语音实时转译」需要先装好：" + "、".join(blockers) + "。",
+            detail="请在首页下方的「语音模型」「虚拟声卡」卡片里下载安装，全部就绪后入口会自动变为可用。\n"
+            "「01 会议实时翻译」和「02 划词翻译」不需要这些，可以直接使用。",
+        )
+        return False
 
     def _on_model_action(self, action: str) -> None:
         if action == "详细":
             self._show_model_detail()
-            return
-        if self._model_busy:
-            return
-        if action == "重新检测":
+        elif action in ("下载", "查看进度"):
+            self._open_model_dialog()
+        elif action == "重新检测" and not self._model_busy and not self._model_jobs:
             self._rescan_models()
-        elif action == "安装运行时":
-            self._install_runtime()
-        elif action == "下载":
-            self._download_models()
+
+    # ---- 语音模型下载窗 ----
+
+    _RUNTIME_ROW = "runtime"
+
+    def _model_rows(self) -> list[ModelRow]:
+        manager = self.model_manager
+        try:
+            runtime_ready = tts_runtime.is_ready()
+        except Exception:  # noqa: BLE001
+            runtime_ready = False
+        uv_text = "检测到 uv" if tts_runtime.find_uv() else "未检测到 uv，会先自动下载 uv"
+        rows = [
+            ModelRow(
+                key=self._RUNTIME_ROW,
+                name="语音运行时",
+                role="中→日 Style-Bert-VITS2 独立环境",
+                size="约 400MB",
+                source="uv → Python 3.12（npmmirror）→ 清华 PyPI + 本项目 release tts-runtime-v1",
+                ready=runtime_ready,
+                status="已就绪" if runtime_ready else f"未安装 · {uv_text}",
+            )
+        ]
+        for group in download_groups():
+            need = manager.group_missing_bytes(group.key)
+            rows.append(
+                ModelRow(
+                    key=group.key,
+                    name=group.name,
+                    role=group.role,
+                    size=human_size(group.size) if not need else f"约 {human_size(need)}",
+                    source=group.source,
+                    ready=not need,
+                    status="已就绪" if not need else ("部分已下载，可续传" if need < group.size else "未下载"),
+                )
+            )
+        return rows
+
+    def _open_model_dialog(self) -> None:
+        if self._model_dialog is None:
+            dlg = ModelDownloadDialog(self.home)
+            dlg.download_requested.connect(lambda key: self._start_model_job([key]))
+            dlg.pause_requested.connect(self._pause_model_job)
+            dlg.download_all_requested.connect(
+                lambda: self._start_model_job([r.key for r in self._model_rows() if not r.ready])
+            )
+            dlg.pause_all_requested.connect(lambda: [self._pause_model_job(k) for k in list(self._model_jobs)])
+            self._model_dialog = dlg
+        self._update_model_dialog(force=True)
+        self._model_dialog.show()
+        self._model_dialog.raise_()
+        self._model_dialog.activateWindow()
+
+    def _update_model_dialog(self, *, force: bool = False) -> None:
+        dlg = self._model_dialog
+        if dlg is None or not (force or dlg.isVisible()):
+            return
+        running = frozenset(self._model_jobs)
+        cache = getattr(self, "_model_rows_cache", None)
+        # 进度约每 1MB 回调一次；只在有任务开始 / 结束时重新检测文件
+        if force or not running or cache is None or cache[0] != running:
+            try:
+                cache = (running, self._model_rows())
+            except Exception as e:  # noqa: BLE001
+                log.warning("检测语音模型失败：%s", e)
+                return
+            self._model_rows_cache = cache
+        jobs = {k: (j["text"], j["done"], j["total"]) for k, j in self._model_jobs.items()}
+        dlg.update_rows(cache[1], jobs=jobs, paused=self._model_paused)
+
+    def _update_model_card(self) -> None:
+        """首页卡片汇总所有在跑的下载：一项时显示它的进度，多项时合计字节。"""
+        jobs = self._model_jobs
+        if not jobs:
+            return
+        if len(jobs) == 1:
+            key, job = next(iter(jobs.items()))
+            text = f"{self._model_dialog_name(key)}：{job['text']}"
+            done, total = job["done"], job["total"]
+        else:
+            sized = [j for j in jobs.values() if j["total"] > 0]
+            done = sum(j["done"] for j in sized)
+            total = sum(j["total"] for j in sized)
+            text = f"{len(jobs)} 项同时下载"
+            if total:
+                text += f" · {human_size(done)} / {human_size(total)}"
+        self.home.set_model_state(text, primary="查看进度", busy=True, done=done, total=total, keep_buttons=True)
+
+    def _start_model_job(self, keys: list[str]) -> None:
+        """每个 key（runtime / melo / sbv2 / bert）各开一个线程，可以同时下载；已在下的跳过。"""
+        keys = [k for k in keys if k not in self._model_jobs]
+        if not keys:
+            return
+        for key in keys:
+            cancel = threading.Event()
+            self._model_jobs[key] = {"cancel": cancel, "text": "准备下载…", "done": 0, "total": 0, "code": ""}
+            self._model_paused.discard(key)
+            threading.Thread(target=self._model_job_worker, args=(key, cancel), daemon=True).start()
+        self._update_model_card()
+        self._update_model_dialog()
+
+    def _pause_model_job(self, key: str) -> None:
+        job = self._model_jobs.get(key)
+        if job is None or job["cancel"].is_set():
+            return
+        job["cancel"].set()
+        job["text"] = "正在暂停…"
+        self._update_model_card()
+        self._update_model_dialog()
+
+    def _model_job_worker(self, key: str, cancel: threading.Event) -> None:
+        """后台线程：下一项。结果经 home_done("model:<key>") 回到主线程。"""
+        tag = f"model:{key}"
+        try:
+            if key == self._RUNTIME_ROW:
+                tts_runtime.install(
+                    on_log=lambda text: self.bridge.home_progress.emit(tag, text, 0, 0),
+                    download_uv_if_missing=True,
+                    cancel=cancel,
+                )
+            else:
+                # 每个任务一个独立的 ModelManager：进度回调和取消标志互不干扰；三组文件不重叠，可并行
+                manager = ModelManager(self.model_manager.root, self.model_manager.mirror, cancel=cancel)
+                need = max(1, manager.group_missing_bytes(key))
+                state = {"name": None, "base": 0, "last": 0, "got": 0}
+
+                def progress(name, done, total):
+                    # 回调是单文件进度；累加已下完的文件，换算成整项进度
+                    if name != state["name"]:
+                        if state["name"] is not None:
+                            state["base"] += state["last"]
+                        state["name"] = name
+                    state["last"] = total
+                    got = state["got"] = min(need, state["base"] + done)
+                    self.bridge.home_progress.emit(tag, f"{human_size(got)} / {human_size(need)}（{name}）", got, need)
+
+                manager.on_progress = progress
+                manager.on_status = lambda text: self.bridge.home_progress.emit(tag, text, state["got"], need)
+                manager.ensure_group(key)
+            self.bridge.home_done.emit(tag, True, f"{self._model_dialog_name(key)} 已就绪")
+        except Exception as e:  # noqa: BLE001
+            if cancel.is_set():
+                self.bridge.home_done.emit(tag, False, "已暂停")
+                return
+            log.exception("下载 %s 失败", key)
+            job = self._model_jobs.get(key)
+            if job is not None:
+                job["code"] = getattr(e, "code", "")
+            self.bridge.home_done.emit(tag, False, str(e))
+
+    def _confirm_duplex_download(self, what: str) -> bool:
+        """下载前提醒：这些只给「03 语音实时转译」用，避免只用字幕 / 划词的人误下。"""
+        if self._duplex_download_confirmed:
+            return True
+        self._duplex_download_confirmed = msg.ask(
+            self.home,
+            "只有语音实时转译需要",
+            f"{what}只给「03 语音实时转译」使用。",
+            detail="「01 会议实时翻译」和「02 划词翻译」不需要语音模型、语音运行时和虚拟声卡，可以直接使用。\n"
+            "要用语音实时转译才继续。",
+            yes="继续",
+            no="取消",
+        )
+        return self._duplex_download_confirmed
 
     def _rescan_models(self) -> None:
         """手动「重新检测」：先亮一下「正在检测」，再给带上时间戳的结果。"""
-        if self._model_busy:
+        if self._model_busy or self._model_jobs:
             return
         self._model_busy = True
         self.home.set_model_state("正在检测语音模型…", busy=True)
@@ -1348,48 +1605,6 @@ class App:
     def _finish_rescan_models(self) -> None:
         self._model_busy = False
         self._refresh_resources(rescan=True)
-
-    def _download_models(self) -> None:
-        if self._model_busy:
-            return
-        self._model_busy = True
-        self.home.set_model_state("准备下载…", primary="下载", busy=True, done=0, total=1)
-        manager = self.model_manager
-
-        def progress(name: str, done: int, total: int) -> None:
-            self.bridge.home_progress.emit("model", f"下载 {name}", done, total)
-
-        def work() -> None:
-            try:
-                manager.on_progress = progress
-                manager.ensure("melo")
-                manager.ensure("sbv2")
-                self.bridge.home_done.emit("model", True, "语音模型已安装")
-            except Exception as e:  # noqa: BLE001
-                log.exception("下载语音模型失败")
-                self.bridge.home_done.emit("model", False, str(e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _install_runtime(self) -> None:
-        """用系统 Python 3.12 建独立 venv 装 Style-Bert-VITS2（约 400MB）。"""
-        if self._model_busy:
-            return
-        self._model_busy = True
-        self.home.set_model_state("正在安装语音运行时…", busy=True, done=0, total=1)
-
-        def progress(text: str) -> None:
-            self.bridge.home_progress.emit("runtime", text, 0, 1)
-
-        def work() -> None:
-            try:
-                tts_runtime.install(on_log=progress)
-                self.bridge.home_done.emit("runtime", True, "语音运行时已就绪")
-            except Exception as e:  # noqa: BLE001
-                log.exception("安装语音运行时失败")
-                self.bridge.home_done.emit("runtime", False, str(e))
-
-        threading.Thread(target=work, daemon=True).start()
 
     def _show_model_detail(self) -> None:
         DetailDialog(
@@ -1443,6 +1658,8 @@ class App:
             return
         if action != "下载安装":
             return
+        if not self._confirm_duplex_download("虚拟声卡（VB-Audio，需要管理员权限安装）"):
+            return
         self._cable_busy = True
         self.home.set_cable_state("准备下载安装包…", primary="下载安装", busy=True, done=0, total=1)
 
@@ -1492,34 +1709,57 @@ class App:
                 progress(dest.name, done, max(total, done))
 
     def _show_runtime_error(self, message: str) -> None:
-        """运行时装失败（多半是没装 Python 3.12）：给一条直接去下载的路。"""
-        box = QMessageBox(self.home)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("语音运行时")
-        box.setText("语音运行时没能装好")
-        box.setInformativeText(message)
-        open_btn = box.addButton("打开 Python 下载页", QMessageBox.ButtonRole.ActionRole)
-        box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
-        if box.clickedButton() is open_btn:
+        """运行时装失败。没有 Python 3.12 时给「自动下载并安装」（下载 uv，由它拉 Python）。"""
+        auto, open_page = "自动下载并安装", "打开 Python 下载页"
+        buttons = [open_page, "关闭"]
+        if self._runtime_error_code == "python_missing":
+            buttons.insert(0, auto)
+        clicked = msg.choose(
+            self.home, "语音运行时", "语音运行时没能装好", buttons, detail=message, kind="warning"
+        )
+        if clicked == auto:
+            self._start_model_job([self._RUNTIME_ROW])
+        elif clicked == open_page:
             QDesktopServices.openUrl(QUrl(tts_runtime.PYTHON_DOWNLOAD_URL))
 
     def _on_home_progress(self, kind: str, text: str, done: int, total: int) -> None:
-        if kind == "model":
-            self.home.set_model_state(text, primary="下载", busy=True, done=done, total=total)
-        elif kind == "runtime":
-            self.home.set_model_state(text, primary="安装运行时", busy=True, done=0, total=1)
+        if kind.startswith("model:"):
+            job = self._model_jobs.get(kind.partition(":")[2])
+            if job is None or job["cancel"].is_set():
+                return  # 已点暂停：别让还在路上的进度把「正在暂停…」盖掉
+            job.update(text=text, done=done, total=total)
+            self._update_model_card()
+            self._update_model_dialog()
         elif kind == "cable":
             self.home.set_cable_state(text, primary="下载安装", busy=True, done=done, total=total)
 
+    def _model_dialog_name(self, key: str) -> str:
+        if key == self._RUNTIME_ROW:
+            return "语音运行时"
+        return next((g.name for g in download_groups() if g.key == key), key)
+
     def _on_home_done(self, kind: str, ok: bool, message: str) -> None:
-        if kind in ("model", "runtime"):
-            self._model_busy = False
-            if kind == "runtime" and not ok:
+        if kind.startswith("model:"):
+            key = kind.partition(":")[2]
+            job = self._model_jobs.pop(key, None)
+            name = self._model_dialog_name(key)
+            paused = job is not None and job["cancel"].is_set()
+            if paused:
+                self._model_paused.add(key)
+            elif ok:
+                self._model_paused.discard(key)
+            # 先把卡片 / 列表刷成最新，再弹可能是模态的提示
+            self._refresh_resources()
+            self._update_model_card()
+            if paused:
+                return
+            if ok:
+                self._notify("语音模型", message)
+            elif key == self._RUNTIME_ROW:
+                self._runtime_error_code = job["code"] if job else ""
                 self._show_runtime_error(message)
             else:
-                self._notify("语音运行时" if kind == "runtime" else "语音模型", message, warning=not ok)
-            self._refresh_resources()
+                self._notify("语音模型", f"{name}：{message}", warning=True)
         elif kind == "cable":
             self._cable_busy = False
             self._notify("虚拟声卡", message, warning=not ok)
@@ -1528,13 +1768,20 @@ class App:
     def _on_teams_action(self, action: str) -> None:
         if action == "打开 Teams":
             if not QDesktopServices.openUrl(QUrl("msteams:")):
-                QMessageBox.information(self.home, "打开 Teams", "没有找到 Teams。请先安装 Microsoft Teams。")
+                msg.info(self.home, "打开 Teams", "没有找到 Teams。请先安装 Microsoft Teams。")
             return
-        QMessageBox.information(
+        msg.info(
             self.home,
-            "会议软件配置步骤（以 Teams 为例）",
-            "以 Teams 为例，其他会议软件（Zoom / 腾讯会议 / 飞书 / Google Meet）同理，只是入口在各自的音频设置里：\n\n"
-            "1. 先点「下载安装」装好 CABLE-A/B。 2. Teams → 设置 → 设备：扬声器 = CABLE Input (VB-Audio Virtual Cable)，麦克风 = Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)。 3. 关闭 Teams 的降噪/回声消除（如果开了会切掉虚拟声卡的声音）。 4. 回到首页点「语音实时转译」，再在悬浮窗点「开始」。 5. 第一次使用先点「自检」，再点「试听日语」。",
+            "会议软件配置步骤",
+            "以 Teams 为例，其他会议软件（Zoom / 腾讯会议 / 飞书 / Google Meet）同理，只是入口在各自的音频设置里：",
+            steps=[
+                "先点「下载安装」装好 CABLE-A/B。",
+                "Teams → 设置 → 设备：扬声器 = CABLE Input (VB-Audio Virtual Cable)，"
+                "麦克风 = Hi-Fi Cable Output (VB-Audio Hi-Fi Cable)。",
+                "关闭 Teams 的降噪 / 回声消除（开着会切掉虚拟声卡的声音）。",
+                "回到首页点「语音实时转译」，再在悬浮窗点「开始」。",
+                "第一次使用先点「自检」，再点「试听日语」。",
+            ],
         )
 
     def open_settings(self) -> None:
@@ -1611,10 +1858,11 @@ class App:
         new_model = (dlg.model.currentData() or self.settings.model, dlg.effort.currentText())
         custom = dlg.provider.currentData() == "openai"
         dlg.apply()
-        if self.settings.show_overlay:
-            self._show_overlay()
-        else:
+        if not self.settings.show_overlay:
             self.overlay.hide()
+        elif self.state != IDLE:
+            # 只在会话中才弹回悬浮框；停在主界面时改设置不该冒出 01 的悬浮框
+            self._show_overlay()
         if self._service_key() != old_service:
             self._rebind_backend()
             self._refresh_models()  # 换服务商后托盘菜单里的模型名也得跟着换
@@ -1648,7 +1896,7 @@ class App:
         try:
             backend = make_backend(self.settings, self.bridge.status.emit)
         except Exception as e:  # 配置不完整：提示但不打断
-            QMessageBox.warning(self.overlay, "模型服务", str(e))
+            msg.warn(self.overlay, "模型服务", str(e))
             return
         self._watch(self.translator.use_backend(backend), "rebind")
 
@@ -1675,12 +1923,34 @@ class App:
                 avail.top() + max(0, (avail.height() - dlg.height()) // 2),
             )
 
+    def shutdown_audio(self, notify: bool = False) -> None:
+        """释放所有音频资源；可重复调用，也可在控制台关闭回调（非 GUI 线程）里调用。
+
+        顺序：先停采集线程（关闭 WASAPI 录音流）→ 停 TTS 与播放线程 → 最后切回默认输出，
+        避免在流还开着时改默认端点。
+        """
+        with self._shutdown_lock:
+            for step in (self._stop_capture, self._close_tts):
+                try:
+                    step()
+                except Exception:
+                    log.exception("退出清理失败：%s", step.__name__)
+            try:
+                self._restore_default_output(notify=notify)
+            except Exception:
+                log.exception("退出时恢复默认输出失败")
+
     def quit(self) -> None:
-        if self.state != IDLE:
-            self._stop_capture()
-            self._restore_default_output()
-            if self.transcript:
+        if self._shut_down:
+            return
+        self._shut_down = True
+        was_active = self.state != IDLE
+        self.shutdown_audio()
+        if was_active and self.transcript:
+            try:
                 self.transcript.save()
+            except Exception:
+                log.exception("退出时保存记录失败")
         if self.hotkey:
             self.hotkey.stop()
         if self.selection_hotkey:
@@ -1692,6 +1962,16 @@ class App:
         self.qapp.quit()
 
 
+def close_splash() -> None:
+    """关掉 PyInstaller 打包版的启动画面；源码运行时没有 pyi_splash，什么也不做。"""
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+
+        pyi_splash.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _set_app_user_model_id() -> None:
     """把任务栏从 python.exe 分组里摘出来，使用本程序图标。"""
     if sys.platform != "win32":
@@ -1700,6 +1980,33 @@ def _set_app_user_model_id() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("YangCode.MeetingTranslate")
     except Exception:
         log.debug("设置 AppUserModelID 失败", exc_info=True)
+
+
+def _install_exit_hooks(qapp: QApplication, app: "App") -> None:
+    """非正常退出（Ctrl+C、关掉终端窗口、注销/关机）也要先释放音频再走。"""
+    qapp.aboutToQuit.connect(lambda: app.shutdown_audio())
+    if sys.platform != "win32":
+        return
+    from ctypes import wintypes
+
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    def on_console(event: int) -> bool:
+        # 0=Ctrl+C 1=Ctrl+Break 2=关闭控制台 5=注销 6=关机；回调在系统线程里，只做线程安全的清理。
+        log.info("收到控制台事件 %s，释放音频后退出", event)
+        try:
+            app.shutdown_audio()
+            if app.state != IDLE and app.transcript:
+                app.transcript.save()
+        except Exception:
+            log.exception("控制台退出清理失败")
+        logging.shutdown()
+        os._exit(0)
+
+    handler = handler_type(on_console)
+    app._console_handler = handler  # 防止回调被 GC
+    if not ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True):
+        log.debug("注册控制台回调失败")
 
 
 def main() -> None:
@@ -1718,5 +2025,6 @@ def main() -> None:
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
     qapp.setWindowIcon(_icon())
-    app = App(qapp)  # noqa: F841
+    app = App(qapp)
+    _install_exit_hooks(qapp, app)
     sys.exit(qapp.exec())

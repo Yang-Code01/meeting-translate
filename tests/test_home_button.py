@@ -87,3 +87,34 @@ def test_meeting_end_keeps_overlay_and_does_not_show_home() -> None:
     app._ask_summarize = lambda: asked.append(True)  # type: ignore[method-assign]
     app._on_job_done("meeting_ended", None)
     assert asked == [True]
+
+
+def test_overlay_scroll_follows_unless_user_scrolls_up() -> None:
+    qapp = QApplication.instance() or QApplication([])  # noqa: F841
+    overlay = Overlay(Settings())
+    overlay.resize(500, 260)
+    overlay.show()
+    for i in range(60):
+        overlay.entries.append(Entry(i, 0.0, "对方", f"第{i}句" * 8, f"译文{i}" * 8))
+    overlay.render()
+    sb = overlay.view.verticalScrollBar()
+    assert sb.maximum() > 0 and sb.value() == sb.maximum()
+    assert overlay.btn_bottom.isHidden()
+
+    sb.setValue(0)  # 用户往上翻
+    assert overlay.btn_bottom.isVisible()
+    first = overlay.view.toPlainText().splitlines()[0]
+    overlay.entries.append(Entry(60, 0.0, "对方", "新的一句", "新译文"))
+    overlay.render()
+    assert sb.value() == 0  # 不再被拉到底
+    assert overlay.view.toPlainText().splitlines()[0] == first  # 顶部条目没被裁掉
+
+    overlay.btn_bottom.click()
+    assert sb.value() == sb.maximum() and overlay.btn_bottom.isHidden()
+    sb.setValue(0)
+    sb.setValue(sb.maximum())  # 手动拖回底部也恢复跟随
+    assert overlay.btn_bottom.isHidden()
+    overlay.entries.append(Entry(61, 0.0, "对方", "再一句", "再译文"))
+    overlay.render()
+    assert sb.value() == sb.maximum()
+    overlay.deleteLater()

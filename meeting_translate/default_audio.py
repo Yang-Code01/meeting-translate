@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from dataclasses import dataclass
@@ -98,6 +99,31 @@ def find_output(name: str, devices: list[OutputDevice] | None = None) -> OutputD
 
 def _label(dev: OutputDevice | None) -> str:
     return dev.name if dev else "未知设备"
+
+
+def save_pending(path, previous: OutputDevice | None) -> None:
+    """切换成功后记下原设备；程序被强杀时，下次启动据此切回。"""
+    if previous is None:
+        return
+    try:
+        path.write_text(json.dumps({"id": previous.id, "name": previous.name}, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        log.debug("写入待恢复设备失败", exc_info=True)
+
+
+def load_pending(path) -> OutputDevice | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return OutputDevice(str(data["id"]), str(data["name"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def clear_pending(path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.debug("删除待恢复设备记录失败", exc_info=True)
 
 
 class DefaultOutputSwitch:

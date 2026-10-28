@@ -82,3 +82,17 @@ def test_missing_target_raises() -> None:
     )
     with pytest.raises(AudioSwitchError):
         switch.switch_to("CABLE")
+
+def test_pending_restore_roundtrip(tmp_path) -> None:
+    from meeting_translate.default_audio import clear_pending, load_pending, save_pending
+
+    path = tmp_path / "pending.json"
+    assert load_pending(path) is None
+    save_pending(path, None)
+    assert not path.exists()
+    save_pending(path, HEADPHONE)
+    assert load_pending(path) == HEADPHONE
+    clear_pending(path)
+    assert load_pending(path) is None
+    path.write_text("{broken", encoding="utf-8")
+    assert load_pending(path) is None

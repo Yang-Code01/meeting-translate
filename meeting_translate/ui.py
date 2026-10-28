@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QProgressBar,
     QProgressDialog,
     QPushButton,
@@ -44,9 +43,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import audio, lang, secrets, stats
+from . import audio, duplex_audio, lang, secrets, stats
+from . import message_dialog as msg
 from .asr import downloadable, model_ready, model_target_dir
 from .config import HF_BASE, Settings
+from .mic_test import MicTestWidget, SpeakerTestWidget
 from .openai_backend import normalize_base_url
 from .transcript import Entry, fmt_aic
 from .translator import ModelOption
@@ -393,6 +394,24 @@ class Overlay(QWidget):
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         for w in (self.status, self.latency, self.usage, self.view.viewport()):
             w.installEventFilter(self)
+        # 自动跟随最新内容；用户往上翻时暂停跟随，拖回底部或点「回到底部」恢复
+        self._follow = True
+        self._rendering = False
+        self._frozen_start = 0
+        self._last_html: str | None = None
+        sb = self.view.verticalScrollBar()
+        sb.valueChanged.connect(self._on_scroll_value)
+        sb.rangeChanged.connect(self._on_scroll_range)
+        self.btn_bottom = QPushButton("↓ 回到底部", self.view.viewport())
+        self.btn_bottom.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bottom.setStyleSheet(
+            "QPushButton{background:rgba(91,140,255,220);color:white;border:none;"
+            "border-radius:11px;padding:3px 10px;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{background:rgba(120,162,255,240);}"
+        )
+        self.btn_bottom.adjustSize()
+        self.btn_bottom.clicked.connect(self.scroll_to_bottom)
+        self.btn_bottom.hide()
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 6, 6, 2)
@@ -434,6 +453,7 @@ class Overlay(QWidget):
         self.view.setFont(QFont(settings.font_family or "Microsoft YaHei UI", settings.font_size))
         self.view.setStyleSheet(f"background:transparent;color:{self._font_color};")
         self.update()
+        self._last_html = None
         self.render()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
@@ -480,6 +500,8 @@ class Overlay(QWidget):
         super().mouseDoubleClickEvent(e)
 
     def eventFilter(self, obj, event) -> bool:
+        if obj is self.view.viewport() and event.type() == QEvent.Type.Resize:
+            self._place_bottom_button()
         if (
             event.type() == QEvent.Type.MouseButtonDblClick
             and isinstance(obj, QWidget)
@@ -627,7 +649,49 @@ class Overlay(QWidget):
     def clear(self) -> None:
         self.entries.clear()
         self.partials.clear()
+        self._set_follow(True)
         self.render()
+
+    # ---- 滚动跟随 ----
+
+    def _place_bottom_button(self) -> None:
+        vp = self.view.viewport()
+        self.btn_bottom.move(max(0, vp.width() - self.btn_bottom.width() - 8), 6)
+
+    def _set_follow(self, follow: bool) -> None:
+        if follow == self._follow:
+            return
+        self._follow = follow
+        if not follow:
+            # 冻结可见范围的起点：翻看历史时不让顶部条目被裁掉、内容整体上跳
+            self._frozen_start = max(0, len(self.entries) - MAX_VISIBLE_ENTRIES)
+        self.btn_bottom.setVisible(not follow)
+        if not follow:
+            self._place_bottom_button()
+            self.btn_bottom.raise_()
+
+    def _on_scroll_value(self, value: int) -> None:
+        if self._rendering:
+            return
+        sb = self.view.verticalScrollBar()
+        self._set_follow(value >= sb.maximum() - 4)
+
+    def _on_scroll_range(self, _minimum: int, maximum: int) -> None:
+        if self._follow:
+            prev, self._rendering = self._rendering, True
+            self.view.verticalScrollBar().setValue(maximum)
+            self._rendering = prev
+
+    def scroll_to_bottom(self) -> None:
+        self._set_follow(True)
+        self.render()
+        sb = self.view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _visible_entries(self) -> list:
+        if self._follow:
+            return self.entries[-MAX_VISIBLE_ENTRIES:]
+        return self.entries[min(self._frozen_start, len(self.entries)) :]
 
     def render(self) -> None:
         src_style = f"color:{self._src_color};font-size:{self._src_size}pt"
@@ -635,7 +699,7 @@ class Overlay(QWidget):
         rows = []
         if self._subtitle_mode:
             # 视频字幕：只保留已有译文，不显示原文、说话方标签和未完成的识别片段。
-            for e in self.entries[-MAX_VISIBLE_ENTRIES:]:
+            for e in self._visible_entries():
                 text = (e.zh or "").strip()
                 if text:
                     rows.append(
@@ -643,7 +707,7 @@ class Overlay(QWidget):
                         f"<span style='{zh_style}'>{html.escape(text)}</span></div>"
                     )
         else:
-            for e in self.entries[-MAX_VISIBLE_ENTRIES:]:
+            for e in self._visible_entries():
                 ja = f"<span style='{src_style}'>【{e.source}】{html.escape(e.ja)}</span>"
                 if e.zh == "":  # 语气词：只显示不翻译
                     rows.append(f"<div style='margin-bottom:6px'>{ja}</div>")
@@ -658,9 +722,21 @@ class Overlay(QWidget):
                     rows.append(
                         f"<div style='{src_style}'><i>【{src}】{html.escape(text)} …</i></div>"
                     )
-        self.view.setHtml("".join(rows))
+        html_text = "".join(rows)
+        if html_text == self._last_html:
+            return
+        self._last_html = html_text
         sb = self.view.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        keep = sb.value()
+        # setHtml 会先把滚动条打回顶部：整段关掉重绘，避免「顶部→底部」来回跳造成闪烁
+        self._rendering = True
+        self.view.setUpdatesEnabled(False)
+        try:
+            self.view.setHtml(html_text)
+            sb.setValue(sb.maximum() if self._follow else min(keep, sb.maximum()))
+        finally:
+            self.view.setUpdatesEnabled(True)
+            self._rendering = False
 
 
 _RUBY_RE = re.compile(r"([\u3400-\u9fff\uf900-\ufaff々〆ヶ]+)[（(]([\u3041-\u309f\u30a0-\u30ffー]+)[）)]")
@@ -1181,13 +1257,13 @@ class ProfileDialog(QDialog):
     def _ok(self) -> None:
         base_url = normalize_base_url(self.base_url.text())
         if not self.name.text().strip() or not base_url:
-            QMessageBox.warning(self, "模型服务", "名称和接口地址都不能为空。")
+            msg.warn(self, "模型服务", "名称和接口地址都不能为空。")
             return
         if not base_url.startswith(("http://", "https://")):
-            QMessageBox.warning(self, "模型服务", "接口地址要以 http:// 或 https:// 开头。")
+            msg.warn(self, "模型服务", "接口地址要以 http:// 或 https:// 开头。")
             return
         if not self.api_key.text().strip() and not self._existing.get("api_key"):
-            QMessageBox.warning(self, "模型服务", "请填写 API key。")
+            msg.warn(self, "模型服务", "请填写 API key。")
             return
         self.base_url.setText(base_url)  # 顺手补全协议头，保存后配置里就是可直接用的地址
         self.accept()
@@ -1382,6 +1458,17 @@ class SettingsDialog(QDialog):
             "系统默认会跟随 Windows 默认输出，可能被改成 CABLE。"
         )
         self._select(self.local_speaker, settings.duplex_local_speaker)
+        speakers = audio.list_speakers()
+        self.speaker_test = SpeakerTestWidget(
+            self.local_speaker.currentData,
+            lambda _none: duplex_audio._physical_speaker(speakers),
+        )
+        self.local_speaker.currentIndexChanged.connect(lambda _i: self.speaker_test.refresh())
+        local_box = QVBoxLayout()
+        local_box.setContentsMargins(0, 0, 0, 0)
+        local_box.setSpacing(6)
+        local_box.addWidget(self.local_speaker)
+        local_box.addWidget(self.speaker_test)
 
         self.mic = flexible_combo(ChevronCombo())
         self.mic.addItem("不翻译麦克风", "__off__")
@@ -1389,6 +1476,26 @@ class SettingsDialog(QDialog):
         for n in audio.list_microphones():
             self.mic.addItem(n, n)
         self._select(self.mic, settings.mic_device if settings.mic_enabled else "__off__")
+        self.mic.setToolTip(
+            "01 会议实时翻译：选「不翻译麦克风」只翻对方；选设备则把你说的话也识别出来。\n"
+            "03 双向同传：你说的中文从这里采集，翻成日语送给对方。\n"
+            "必须选真实麦克风（如耳机麦、ジャックマイク），不要选 CABLE / Hi-Fi Cable 等虚拟声卡。\n"
+            "「系统默认」跟随 Windows 默认录音设备，它可能被改成了虚拟声卡。"
+        )
+        self.mic_test = MicTestWidget(self.mic.currentData)
+        self.mic_help = QLabel(
+            "说话识别不出来时：① 点「测试麦克风」对着说话，电平条要跳动；"
+            "② 不动就换一个设备再测；③ Windows「设置 → 隐私和安全性 → 麦克风」允许桌面应用访问；"
+            "④ 提示音频服务未运行时，在 services.msc 启动「Windows Audio」或重启电脑。"
+        )
+        self.mic_help.setStyleSheet("color:#8991a4")
+        self.mic_help.setWordWrap(True)
+        mic_box = QVBoxLayout()
+        mic_box.setContentsMargins(0, 0, 0, 0)
+        mic_box.setSpacing(6)
+        mic_box.addWidget(self.mic)
+        mic_box.addWidget(self.mic_test)
+        mic_box.addWidget(self.mic_help)
 
         self.direction = flexible_combo(ChevronCombo())
         for d in lang.DIRECTIONS.values():
@@ -1593,8 +1700,8 @@ class SettingsDialog(QDialog):
 
         form_dev.addRow("对方声音（单方向环回）", self.speaker)
         form_dev.addRow("对方声音（双向同传采集）", self.capture_speaker)
-        form_dev.addRow("我的声音（麦克风）", self.mic)
-        form_dev.addRow("本地耳机（中文 TTS）", self.local_speaker)
+        form_dev.addRow("我的声音（麦克风）", mic_box)
+        form_dev.addRow("本地耳机（中文 TTS）", local_box)
         form_tr.addRow("翻译方向", direction_row)
         form_tr.addRow("语音识别引擎（日→中）", self.engine)
         form_tr.addRow("识别纠错", self.asr_correct)
@@ -1848,12 +1955,14 @@ class SettingsDialog(QDialog):
         self.dirty_hint.setText("有未保存的改动" if self.is_dirty() else "")
 
     def _confirm_restore_defaults(self) -> None:
-        answer = QMessageBox.question(
+        if msg.ask(
             self,
             "恢复默认设置",
-            "把所有设置恢复为默认值？\n自定义模型端点（含 API key）会保留。点「保存」后才生效。",
-        )
-        if answer == QMessageBox.StandardButton.Yes:
+            "把所有设置恢复为默认值？",
+            detail="自定义模型端点（含 API key）会保留。点「保存」后才生效。",
+            yes="恢复默认",
+            no="取消",
+        ):
             self._restore_defaults()
 
     def _restore_defaults(self) -> None:
@@ -1967,10 +2076,10 @@ class SettingsDialog(QDialog):
     def _open_selection_history(self) -> None:
         path = Path(self.selection_history_path.text())
         if not path.is_file():
-            QMessageBox.information(self, "翻译历史", "历史文件尚未创建，请先点击「保存划词/句翻译历史」。")
+            msg.info(self, "翻译历史", "历史文件尚未创建，请先点击「保存划词/句翻译历史」。")
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
-            QMessageBox.warning(self, "翻译历史", f"无法打开文件：\n{path}")
+            msg.warn(self, "翻译历史", f"无法打开文件：\n{path}")
 
     def _browse_save_dir(self) -> None:
         start = self.save_dir.text() or str(Path.home() / "Documents")
@@ -2001,7 +2110,7 @@ class SettingsDialog(QDialog):
         p = dlg.result_profile()
         names = {x.get("name") for x in self.profiles}
         if p["name"] in names:
-            QMessageBox.warning(self, "模型服务", "已存在同名端点，请换一个名字。")
+            msg.warn(self, "模型服务", "已存在同名端点，请换一个名字。")
             return
         self.profiles.append(p)
         self.provider.setCurrentIndex(self.provider.findData("openai"))
@@ -2024,7 +2133,7 @@ class SettingsDialog(QDialog):
         name = self.profile_combo.currentData()
         if not name:
             return
-        if QMessageBox.question(self, "模型服务", f"删除端点「{name}」？") != QMessageBox.StandardButton.Yes:
+        if not msg.ask(self, "模型服务", f"删除端点「{name}」？", yes="删除", no="取消", kind="warning"):
             return
         self.profiles = [p for p in self.profiles if p.get("name") != name]
         self._reload_profiles()
@@ -2368,7 +2477,7 @@ def download_model(name: str, parent: QWidget | None, on_done: Callable[[bool], 
     def finished(err: str) -> None:
         dlg.close()
         if err:
-            QMessageBox.warning(parent, "下载失败", err)
+            msg.warn(parent, "下载失败", err)
         on_done(not err)
 
     th.done.connect(finished)
