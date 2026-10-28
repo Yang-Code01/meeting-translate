@@ -20,25 +20,27 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work). Th
 | Account | A GitHub Copilot subscription, or an API key for any OpenAI-compatible service (it performs translation and summarization) |
 | Hardware | Any x86-64 CPU; no discrete GPU. Recognition uses 4 threads by default |
 | Microphone | Optional. When enabled your own speech is tagged as *you*; headphones recommended |
-| Voice interpretation | Additionally needs VB-Audio virtual cables (CABLE A+B and Hi-Fi Cable; the app helps you download them), Python 3.12, and ~1.1 GB of speech models |
+| Voice interpretation | Additionally needs VB-Audio virtual cables (CABLE A+B and Hi-Fi Cable; the app helps you download them), a ~400 MB speech runtime (installed by the app), and ~1.1 GB of speech models |
 
 ## Installation
 
 ### Option 1: Download the packaged exe
 
 1. Grab `MeetingTranslate.exe` (about 400 MB, with recognition models and the Copilot runtime bundled) from [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest).
-2. Run it. The first launch unpacks bundled resources (~15 s); a 「译」 tray icon appears when ready.
+2. Run it. The first launch unpacks bundled resources (~15 s, with a splash screen); a 「译」 tray icon appears when ready.
 3. Log in to Copilot on first use — see [Sign in](#sign-in-to-copilot) — or enter your own API key in Settings.
 
 Nothing is written to the registry and no admin rights are needed. Uninstalling means deleting the exe and `%APPDATA%\meeting-translate\`.
 
-To use **voice interpretation** you need a one-time setup (all three steps live on the resource cards of the home screen; each card's 「详细」 button has the full story):
+To use **voice interpretation** you need a one-time setup (all steps live on the resource cards of the home screen; each card's 「详细」 button has the full story).
+Until the speech runtime, speech models and virtual cables are all in place, the 「进入双向同传」 button stays greyed out and the card says what is missing.
 
-1. **Speech runtime** — click 「安装运行时」. The app creates a separate environment with the Python 3.12 on your machine
-   and installs Style-Bert-VITS2 into it (it needs `numpy<2`, which cannot live inside the main app; ~400 MB).
-   If no Python 3.12 is found, it offers a download link.
-2. **Speech models** — click 「下载」 to fetch MeloTTS, Style-Bert-VITS2 and the Japanese BERT, ~1.1 GB.
-3. **Virtual cables** — click 「下载安装」 to install VB-Audio CABLE and Hi-Fi Cable, then set your meeting app's
+1. **Speech runtime and models** — click 「下载」 on the speech-model card to open the download list: the speech runtime, MeloTTS,
+   Style-Bert-VITS2 and the Japanese BERT each get a row with its own download button, or click 「全部下载」 to fetch everything (models ~1.1 GB).
+   The runtime is a separate Python 3.12 environment created with [uv](https://docs.astral.sh/uv/) for Style-Bert-VITS2
+   (it needs `numpy<2`, which cannot live inside the main app; ~400 MB). No pre-installed Python is needed: without uv,
+   the app downloads uv first, which then fetches a standalone Python 3.12.
+2. **Virtual cables** — click 「下载安装」 to install VB-Audio CABLE and Hi-Fi Cable, then set your meeting app's
    speaker to `CABLE Input` and microphone to `Hi-Fi Cable Output` (the app has step-by-step guidance, using Teams as an example).
 
 ### Option 2: Run from source

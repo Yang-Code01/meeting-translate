@@ -101,17 +101,11 @@ def _sounddevice_level(device: str | None, seconds: float) -> ProbeResult:
     import numpy as np
     import sounddevice as sd
 
-    devices = sd.query_devices()
-    index = None
-    if device:
-        for i, item in enumerate(devices):
-            if item["max_input_channels"] > 0 and device in item["name"]:
-                index = i
-                break
+    from .audio import pick_sounddevice_input
+
+    index = pick_sounddevice_input(sd.query_devices(), sd.query_hostapis(), device)
     if index is None:
-        index = sd.default.device[0]
-    if index is None or index < 0:
-        raise RuntimeError("没有可用的默认麦克风")
+        raise RuntimeError("WASAPI/MME 下找不到可用的麦克风")
 
     rate = None
     for candidate in (48000, 44100, 16000):

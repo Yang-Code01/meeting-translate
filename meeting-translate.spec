@@ -28,8 +28,19 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
+# onefile 每次启动要先把 400MB 解压到临时目录（约 15 秒），这期间由 bootloader 显示启动画面；
+# 主窗口出来后 app.close_splash() 关掉它。
+# always_on_top 默认为 True，会一直盖在其他窗口上；关掉后用户切到别的窗口时它能被盖住。
+splash = Splash(
+    str(ROOT / "assets" / "splash.png"),
+    binaries=a.binaries,
+    datas=a.datas,
+    always_on_top=False,
+)
 exe = EXE(
     pyz,
+    splash,
+    splash.binaries,
     a.scripts,
     a.binaries,
     a.datas,

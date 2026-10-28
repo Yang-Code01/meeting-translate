@@ -20,24 +20,26 @@ Windows 桌面小工具，提供三个功能：
 | 账号 | GitHub Copilot 订阅，或任意 OpenAI 兼容服务的 API key（翻译与摘要都由它完成） |
 | 硬件 | 普通 x86-64 CPU 即可，无需独显；识别默认占 4 线程 |
 | 麦克风 | 可选。开启后你自己的话会以【我】标记，需要戴耳机 |
-| 语音实时转译 | 另外需要 VB-Audio 虚拟声卡（CABLE A+B 与 Hi-Fi Cable，程序会引导下载）、Python 3.12、约 1.1 GB 语音模型 |
+| 语音实时转译 | 另外需要 VB-Audio 虚拟声卡（CABLE A+B 与 Hi-Fi Cable，程序会引导下载）、约 400 MB 语音运行时（程序自动装）、约 1.1 GB 语音模型 |
 
 ## 安装
 
 ### 方式一：下载打包好的 exe
 
 1. 到 [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest) 下载 `MeetingTranslate.exe`（约 400 MB，内置识别模型与 Copilot 运行时）。
-2. 双击运行。首次启动要解压内置资源，约 15 秒；就绪后右下角出现「译」托盘图标。
+2. 双击运行。首次启动要解压内置资源，约 15 秒（期间显示启动画面）；就绪后右下角出现「译」托盘图标。
 3. 首次使用需登录 Copilot（见下方[登录](#登录-copilot)），或在设置里改用自己的 API key。
 
 程序不写注册表、不需要管理员权限；卸载就是删掉 exe 和 `%APPDATA%\meeting-translate\`。
 
-想用「语音实时转译」还要做一次准备（入口都在首页三张资源卡上，卡片上的「详细」有完整说明）：
+想用「语音实时转译」还要做一次准备（入口都在首页三张资源卡上，卡片上的「详细」有完整说明）。
+语音运行时、语音模型、虚拟声卡没全部装好之前，「进入双向同传」按钮是灰的，卡片上会写明还缺什么。
 
-1. **语音运行时**：点「安装运行时」，程序会用你机器上的 Python 3.12 建一个独立环境装 Style-Bert-VITS2
-   （要 `numpy<2`，装不进主程序环境，约 400 MB）。没装 Python 3.12 会提示下载地址。
-2. **语音模型**：点「下载」装齐 MeloTTS、Style-Bert-VITS2 与日文 BERT，约 1.1 GB。
-3. **虚拟声卡**：点「下载安装」装 VB-Audio CABLE 与 Hi-Fi Cable；然后在会议软件里把扬声器选
+1. **语音运行时与语音模型**：点「语音模型」卡的「下载」，弹出下载列表：语音运行时、MeloTTS、Style-Bert-VITS2、
+   日文 BERT 各占一行，可以逐项下载，也可以点「全部下载」（模型约 1.1 GB）。语音运行时由 [uv](https://docs.astral.sh/uv/)
+   建一个 Python 3.12 独立环境装 Style-Bert-VITS2（要 `numpy<2`，装不进主程序环境，约 400 MB）；
+   机器上不需要预先装 Python，没有 uv 时程序会先下载 uv，再由 uv 下载独立的 Python 3.12（走国内镜像）。
+2. **虚拟声卡**：点「下载安装」装 VB-Audio CABLE 与 Hi-Fi Cable；然后在会议软件里把扬声器选
    `CABLE Input`、麦克风选 `Hi-Fi Cable Output`（程序里有以 Teams 为例的步骤）。
 
 ### 方式二：从源码运行
