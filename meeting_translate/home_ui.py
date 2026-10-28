@@ -518,7 +518,7 @@ class HomeWindow(QWidget):
 
         self.hotkey_label = QLabel("")
         self.hotkey_label.setObjectName("hotkey")
-        version = QLabel("v0.3.0 · 本地优先")
+        version = QLabel("v0.4.0 · 本地优先")
         version.setObjectName("hotkey")
         footer = QHBoxLayout()
         footer.addWidget(self.hotkey_label, 1)

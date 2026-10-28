@@ -37,6 +37,8 @@ Until the speech runtime, speech models and virtual cables are all in place, the
 
 1. **Speech runtime and models** — click 「下载」 on the speech-model card to open the download list: the speech runtime, MeloTTS,
    Style-Bert-VITS2 and the Japanese BERT each get a row with its own download button, or click 「全部下载」 to fetch everything (models ~1.1 GB).
+   Every row has a progress bar and can be paused/resumed at any time; several rows can download in parallel, and mirror rate limits (HTTP 429)
+   or dropped connections are retried and resumed automatically. Items already present show as ready.
    The runtime is a separate Python 3.12 environment created with [uv](https://docs.astral.sh/uv/) for Style-Bert-VITS2
    (it needs `numpy<2`, which cannot live inside the main app; ~400 MB). No pre-installed Python is needed: without uv,
    the app downloads uv first, which then fetches a standalone Python 3.12.
@@ -95,6 +97,8 @@ The translation direction (JA→ZH / ZH→JA) lives in settings and is **locked 
 - “—” hides it and the tray item “显示/隐藏字幕窗” brings it back. Turn off “show overlay” in Settings to start with only the tray icon and hotkey.
 - Enable “Subtitle mode” in Settings to show translations only, without source text or unfinished fragments—useful as subtitles while watching a video.
 - The “🎤 麦克风” button toggles your own microphone. The state is remembered and takes effect immediately.
+- Subtitles follow the newest line. Scroll up to read back and it stops jumping to the bottom; a “↓ 回到底部” button appears top-right—click it or drag the scrollbar to the bottom to resume following.
+- Left-clicking the tray icon brings the overlay to front during a meeting, otherwise opens the home screen.
 - Tray menu: start/pause, end meeting, show/hide overlay, settings, models (quick switch), edit glossary, open recordings folder, summarize past meeting, sign in, quit.
 - The settings window is modeless, so the overlay stays usable. After changing anything, a hint appears next to OK: “设置已修改，点击 OK 后生效”; closing without OK discards the changes. When the overlay is visible, the settings window opens on whichever side has more room.
 
@@ -127,6 +131,18 @@ them ──▶ meeting app speaker [CABLE-A Input] ══▶ loopback capture �
 - **Turn off noise suppression and echo cancellation** in your meeting app, otherwise the Japanese arriving through the virtual cable is treated as noise and cut.
 - Chinese TTS (MeloTTS) plays locally and returns immediately; Japanese TTS (Style-Bert-VITS2) synthesizes in a separate process and needs ~15 s to load for the first sentence, then 0.5–1 s per sentence. It is pre-warmed in the background when you start interpretation.
 - Sizes, locations and what every file does: 「详细」 on the 「语音模型」 card.
+- While interpreting, the app temporarily switches the Windows default output to CABLE-A and switches it back when you stop or quit. If the app was killed before it could switch back, it does so on the next launch.
+
+### Audio troubleshooting (speech not recognized, no Chinese audio)
+
+Settings → 「声音与设备」 has two self-test buttons:
+
+- **测试麦克风 (Test microphone)** — records 6 s from the selected mic with a live level meter, then reports OK / silent / failed to open.
+  「系统默认」 follows the Windows default recording device, which may have been changed to a virtual cable such as CABLE / Hi-Fi Cable—pick your real microphone instead.
+- **播放测试音 (Play test sound)** — plays a short chime on 「本地耳机（中文 TTS）」 and shows which device it actually used.
+  The local headphone must not be a virtual cable (Chinese TTS and 「试听日语」 would go into the meeting app instead); 「自动」 prefers headphones. Starting interpretation with a virtual cable selected prompts you to switch.
+
+If every device is silent and the app says “Windows 音频服务未运行” (Windows Audio service not running): start “Windows Audio” in `services.msc`, run `Start-Service Audiosrv` as administrator, or reboot.
 
 
 - **Splitting** — 0.6 s of silence ends a segment. If the segment ends in て/が/けど/ので, or is only 1–3 characters, it is treated as unfinished and held for continuation (Chinese uses 的/和/但是/因为 etc.). It waits at most 3 s, flushes anyway after 20 s of merging, and force-splits single segments longer than 10 s. All three are configurable.
@@ -181,7 +197,9 @@ Everything lives in `%APPDATA%\meeting-translate\` and is never uploaded:
 | `glossary.txt` | glossary |
 | `selection_translation_history.md` | selection-translation history (written only when saved) |
 | `transcripts\` | temporary records during a meeting; default location when no save folder is set |
-| `models\` | optionally downloaded models (not needed with the exe) |
+| `models\` | optionally downloaded models (not needed with the exe); `models\tts\` holds the speech models |
+| `runtime\sbv2\` | speech runtime (standalone Python 3.12 environment managed by uv) |
+| `pending_output_restore.json` | original default output saved during interpretation; deleted after a normal stop |
 | `app.log` | log |
 
 After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<timestamp>.md`, written to the configured save folder (asked once at the first meeting end; cancelling keeps this meeting in the default folder and asks again next time). Temporary `.json` files are deleted after the recap completes or is declined, and kept on failure so it can be retried.
@@ -193,7 +211,7 @@ After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<t
 - With a third-party endpoint the meeting text goes to that provider; retention and training policies are theirs to decide. The built-in templates flag common providers — check before using it for confidential meetings.
 - Logs, transcripts and the glossary stay in your local `%APPDATA%` folder.
 - A microphone cannot tell speakers apart: anyone nearby will be tagged as *you*. Turn the microphone off in situations where that matters.
-- The app does not modify system audio settings and installs no drivers.
+- The app installs no drivers by itself (you install the virtual cables); it only switches the Windows default output temporarily during voice interpretation and switches it back afterwards.
 
 ## Known limitations
 
@@ -224,7 +242,7 @@ uv run python main.py
 
 ```powershell
 uv run python main.py        # run once so the SDK downloads the Copilot runtime to %LOCALAPPDATA%
-uv run pyinstaller meeting-translate.spec --noconfirm
+uv run python -m PyInstaller meeting-translate.spec --noconfirm
 # output: dist\MeetingTranslate.exe
 ```
 

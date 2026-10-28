@@ -1,6 +1,6 @@
 [project]
 name = "meeting-translate"
-version = "0.3.0"
+version = "0.4.0"
 description = "Windows 会议实时翻译（日 ⇄ 中）：本地 ASR + GitHub Copilot 翻译，置顶双语字幕与会后纪要"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
