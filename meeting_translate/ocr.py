@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
@@ -10,6 +11,7 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
 
+from .capture import image_to_rgb_array
 from .ocr_layout import compose_text
 
 # 只能在构造 RapidOCR 时设置：线程数 4、检测边长按 max 限制到 960（混合核 CPU 上避免性能退化）。
@@ -45,12 +47,11 @@ def normalize_size(image: np.ndarray) -> np.ndarray:
         return image
     tw, th = max(1, round(w * scale)), max(1, round(h * scale))
     src = np.ascontiguousarray(image, dtype=np.uint8)
-    qimg = QImage(src.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+    # QImage 不持有这块字节：buf 必须活到 scaled 完成之后，否则读到已释放的内存
+    buf = src.tobytes()
+    qimg = QImage(buf, w, h, w * 3, QImage.Format.Format_RGB888)
     scaled = qimg.scaled(tw, th, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    out = scaled.convertToFormat(QImage.Format.Format_RGB888)
-    bpl = out.bytesPerLine()
-    rows = np.frombuffer(out.constBits(), dtype=np.uint8, count=bpl * th).reshape(th, bpl)
-    return rows[:, : tw * 3].reshape(th, tw, 3).copy()
+    return image_to_rgb_array(scaled)
 
 
 @dataclass(frozen=True)
@@ -86,15 +87,17 @@ class RapidOcrEngine:
 
 
 _ENGINE: OcrEngine | None = None
+_ENGINE_LOCK = threading.Lock()  # 界面线程与 OCR 线程都可能首次调用
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr")
 
 
 def default_engine() -> OcrEngine:
-    """进程内单例。"""
+    """进程内单例（加锁，多线程首次调用也只构造一次）。"""
     global _ENGINE
-    if _ENGINE is None:
-        _ENGINE = RapidOcrEngine()
-    return _ENGINE
+    with _ENGINE_LOCK:
+        if _ENGINE is None:
+            _ENGINE = RapidOcrEngine()
+        return _ENGINE
 
 
 def recognize_text(image: np.ndarray, engine: OcrEngine) -> str:
