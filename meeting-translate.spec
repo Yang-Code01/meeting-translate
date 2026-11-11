@@ -1,4 +1,4 @@
-# PyInstaller spec：单 exe，内置 ReazonSpeech/SenseVoice/VAD 模型与 Copilot 运行时。
+# PyInstaller spec：单 exe，内置 ReazonSpeech/SenseVoice/VAD 模型、截图翻译的 OCR 模型与 Copilot 运行时。
 # 构建: uv run pyinstaller meeting-translate.spec --noconfirm
 from pathlib import Path
 
@@ -16,7 +16,10 @@ datas = [
     (str(ROOT / "assets"), "assets"),
 ]
 datas += collect_data_files("sounddevice")
-binaries = collect_dynamic_libs("sherpa_onnx")
+# 截图翻译 OCR：rapidocr 的 default_models.yaml 与内置 PP-OCRv6 模型必须随包收集，
+# 否则启动报 FileNotFoundError，或只有配置没有模型时每次启动联网下载。
+datas += collect_data_files("rapidocr")
+binaries = collect_dynamic_libs("sherpa_onnx") + collect_dynamic_libs("onnxruntime")
 
 a = Analysis(
     [str(ROOT / "main.py")],
