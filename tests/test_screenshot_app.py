@@ -17,6 +17,7 @@ import meeting_translate.app as app_module  # noqa: E402
 from meeting_translate import ocr  # noqa: E402
 from meeting_translate.app import App  # noqa: E402
 from meeting_translate.ocr import OcrLine  # noqa: E402
+from meeting_translate.ocr_layout import NO_JAPANESE_MESSAGE, VERTICAL_MESSAGE  # noqa: E402
 from meeting_translate.result_channel import ResultChannel  # noqa: E402
 from meeting_translate.translator import SelectionTranslation  # noqa: E402
 
@@ -143,7 +144,27 @@ def test_an_empty_recognition_shows_an_error_and_does_not_translate(monkeypatch,
     app._on_screenshot_captured(image(), QPoint(5, 5))
     drain(app)
     assert app.translator.sent == []
-    assert app.selection_popup.calls[-1][0] == "error"
+    assert app.selection_popup.calls[-1] == ("error", NO_JAPANESE_MESSAGE, QPoint(5, 5))
+
+
+def test_a_single_character_recognition_is_rejected_without_translation(monkeypatch, app):
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["日"]))
+    app._on_screenshot_captured(image(), QPoint(5, 5))
+    drain(app)
+    assert app.translator.sent == []
+    assert app.selection_popup.calls[-1][:2] == ("error", NO_JAPANESE_MESSAGE)
+
+
+def test_a_vertical_region_is_rejected_without_translation(monkeypatch, app):
+    class VerticalEngine:
+        def recognize(self, image):
+            return [OcrLine("日本語", 0.99, ((x, 0), (x + 10, 0), (x + 10, 30), (x, 30))) for x in (0, 20, 40)]
+
+    monkeypatch.setattr(ocr, "_ENGINE", VerticalEngine())
+    app._on_screenshot_captured(image(), QPoint(5, 5))
+    drain(app)
+    assert app.translator.sent == []
+    assert app.selection_popup.calls[-1][:2] == ("error", VERTICAL_MESSAGE)
 
 
 def test_an_ocr_failure_shows_an_error_and_the_app_keeps_working(monkeypatch, app):
@@ -156,10 +177,10 @@ def test_an_ocr_failure_shows_an_error_and_the_app_keeps_working(monkeypatch, ap
 
 
 def test_only_the_latest_request_refreshes_the_popup_but_every_result_is_kept_for_history(monkeypatch, app):
-    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["旧"]))
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["旧文"]))
     app._on_screenshot_captured(image(), QPoint(1, 1))
     drain(app)
-    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["新"]))
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["新文"]))
     app._on_screenshot_captured(image(), QPoint(2, 2))
     drain(app)
     app.selection_popup.calls.clear()
@@ -188,3 +209,25 @@ def test_screenshot_hotkey_is_registered_and_replaced_without_touching_selection
     assert first.stopped
     assert app.screenshot_hotkey.spec == "Ctrl+Alt+K"
     assert not selection.stopped
+
+
+def test_alternating_screenshot_and_selection_triggers_refresh_only_the_last_one(monkeypatch, app):
+    """截图与划词共用一个弹窗通道：较早触发的截图结果晚到时只写历史，不刷新弹窗。"""
+    app._active_model = lambda: "gpt-test"
+    app.tray = SimpleNamespace(showMessage=lambda *a: None)
+    anchor_shot, anchor_sel = QPoint(1, 1), QPoint(2, 2)
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["截图原文"]))
+    app._on_screenshot_captured(image(), anchor_shot)
+    drain(app)  # 截图 OCR 完成 → 翻译已提交（未完成）
+    app._on_selection_captured("划词原文", anchor_sel, "")  # 之后触发划词
+    assert app.selection_popup.calls[-1] == ("loading", anchor_sel)
+    assert app.translator.sent == ["截图原文", "划词原文"]
+
+    app.selection_popup.calls.clear()
+    app.translator.futures[1].set_result(SelectionTranslation("划词译", "せん"))  # 最新结果先到
+    drain(app)
+    app.translator.futures[0].set_result(SelectionTranslation("截图译", "しゃ"))  # 较早的截图结果后到
+    drain(app)
+
+    assert app.selection_popup.calls == [("result", "划词译", "せん", anchor_sel)]
+    assert {r.source for r in app._pending_selection_history} == {"截图原文", "划词原文"}

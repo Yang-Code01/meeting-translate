@@ -7,7 +7,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
-from PySide6.QtCore import QPoint, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage, QPixmap  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -104,3 +104,48 @@ def test_image_to_rgb_array_keeps_channel_order_and_size():
     arr = image_to_rgb_array(img)
     assert arr.shape == (2, 3, 3)
     assert arr[1, 2].tolist() == [10, 20, 30]
+
+
+def fake_screen(x: int, y: int, w: int, h: int, color: QColor):
+    """假屏幕：只提供 geometry / devicePixelRatio，快照是纯色图。"""
+    from types import SimpleNamespace
+
+    geometry = QRect(x, y, w, h)
+    return SimpleNamespace(geometry=lambda: geometry, devicePixelRatio=lambda: 1.0, color=color)
+
+
+def solid_snapshot(screen) -> QPixmap:
+    pixmap = QPixmap(screen.geometry().size())
+    pixmap.fill(screen.color)
+    return pixmap
+
+
+def test_one_overlay_per_screen_is_aligned_with_that_screen(qapp):
+    left = fake_screen(-100, 0, 100, 80, QColor(255, 0, 0))
+    right = fake_screen(0, 0, 120, 80, QColor(0, 0, 255))
+    capture = RegionCapture(snapshot=solid_snapshot, screens=lambda: [left, right])
+    capture.start()
+    overlays = sorted(overlays_visible(), key=lambda o: o.geometry().x())
+    assert [o.geometry() for o in overlays] == [QRect(-100, 0, 100, 80), QRect(0, 0, 120, 80)]
+    capture.cancel()
+
+
+def test_a_selection_dragged_across_two_screens_is_stitched_from_both_snapshots(qapp):
+    left = fake_screen(0, 0, 100, 100, QColor(255, 0, 0))
+    right = fake_screen(100, 0, 100, 100, QColor(0, 0, 255))
+    capture = RegionCapture(snapshot=solid_snapshot, screens=lambda: [left, right])
+    results: list = []
+    capture.captured.connect(lambda image, anchor: results.append((image, anchor)))
+    capture.start()
+    first = next(o for o in overlays_visible() if o.geometry().x() == 0)
+    # 按下在左屏，松开在右屏：鼠标隐式抓取，事件仍投递给左屏遮罩（局部坐标可越界）
+    QTest.mousePress(first, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(90, 10))
+    QTest.mouseMove(first, QPoint(109, 19))
+    QTest.mouseRelease(first, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(109, 19))
+    image, anchor = results[0]
+    assert (image.width(), image.height()) == (20, 10)
+    rgb = image_to_rgb_array(image)
+    assert rgb[0, 0].tolist() == [255, 0, 0]  # 左屏部分
+    assert rgb[0, 19].tolist() == [0, 0, 255]  # 右屏部分
+    assert anchor == QPoint(109, 19)
+    assert overlays_visible() == []
