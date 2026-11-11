@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import statistics
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from .ocr import OcrLine
@@ -17,6 +17,20 @@ MIN_MEAN_SCORE = 0.45  # 非空识别行的平均置信度下限（含）
 VERTICAL_RATIO = 1.5  # 框高 > 框宽 × 1.5 判为竖向框
 VERTICAL_SHARE = 0.6  # 竖向框占比超过该值即判为竖排
 ROW_TOLERANCE = 0.6  # 同一行的纵向中心容差 = 行高中位数 × 该系数
+
+
+class Bounds(NamedTuple):
+    """轴对齐包围盒（像素坐标，y 向下）。"""
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class _Placed(NamedTuple):
+    line: OcrLine
+    bounds: Bounds
 
 
 class RecognitionRejected(Exception):
@@ -32,23 +46,23 @@ def compose_text(lines: Sequence[OcrLine]) -> str:
         raise RecognitionRejected(NOT_RECOGNIZED_MESSAGE)
 
     bounds = [_bounds(line) for line in kept]
-    tall = sum(1 for x0, y0, x1, y1 in bounds if (y1 - y0) > (x1 - x0) * VERTICAL_RATIO)
+    tall = sum(1 for b in bounds if (b.y1 - b.y0) > (b.x1 - b.x0) * VERTICAL_RATIO)
     if tall / len(kept) > VERTICAL_SHARE:
         raise RecognitionRejected(VERTICAL_MESSAGE)
 
-    tolerance = statistics.median(y1 - y0 for _, y0, _, y1 in bounds) * ROW_TOLERANCE
-    placed = sorted(zip(kept, bounds), key=lambda item: _center_y(item[1]))
-    rows: list[list[tuple[OcrLine, tuple[float, float, float, float]]]] = []
+    tolerance = statistics.median(b.y1 - b.y0 for b in bounds) * ROW_TOLERANCE
+    placed = sorted((_Placed(line, b) for line, b in zip(kept, bounds)), key=lambda p: _center_y(p.bounds))
+    rows: list[list[_Placed]] = []
     anchor = 0.0  # 当前行第一个框的纵向中心
     for item in placed:
-        cy = _center_y(item[1])
+        cy = _center_y(item.bounds)
         if not rows or cy - anchor > tolerance:
             rows.append([])
             anchor = cy
         rows[-1].append(item)
 
     return "\n".join(
-        "".join(line.text.strip() for line, _ in sorted(row, key=lambda item: item[1][0])) for row in rows
+        "".join(item.line.text.strip() for item in sorted(row, key=lambda p: p.bounds.x0)) for row in rows
     )
 
 
@@ -56,11 +70,11 @@ def _char_count(lines: Sequence[OcrLine]) -> int:
     return sum(len("".join(line.text.split())) for line in lines)
 
 
-def _bounds(line: OcrLine) -> tuple[float, float, float, float]:
+def _bounds(line: OcrLine) -> Bounds:
     xs = [x for x, _ in line.box]
     ys = [y for _, y in line.box]
-    return min(xs), min(ys), max(xs), max(ys)
+    return Bounds(min(xs), min(ys), max(xs), max(ys))
 
 
-def _center_y(bound: tuple[float, float, float, float]) -> float:
-    return (bound[1] + bound[3]) / 2
+def _center_y(bounds: Bounds) -> float:
+    return (bounds.y0 + bounds.y1) / 2
