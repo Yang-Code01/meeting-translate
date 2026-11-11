@@ -17,6 +17,7 @@ import meeting_translate.app as app_module  # noqa: E402
 from meeting_translate import ocr  # noqa: E402
 from meeting_translate.app import App  # noqa: E402
 from meeting_translate.ocr import OcrLine  # noqa: E402
+from meeting_translate.ocr_layout import NO_JAPANESE_MESSAGE, VERTICAL_MESSAGE  # noqa: E402
 from meeting_translate.result_channel import ResultChannel  # noqa: E402
 from meeting_translate.translator import SelectionTranslation  # noqa: E402
 
@@ -143,7 +144,27 @@ def test_an_empty_recognition_shows_an_error_and_does_not_translate(monkeypatch,
     app._on_screenshot_captured(image(), QPoint(5, 5))
     drain(app)
     assert app.translator.sent == []
-    assert app.selection_popup.calls[-1][0] == "error"
+    assert app.selection_popup.calls[-1] == ("error", NO_JAPANESE_MESSAGE, QPoint(5, 5))
+
+
+def test_a_single_character_recognition_is_rejected_without_translation(monkeypatch, app):
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["日"]))
+    app._on_screenshot_captured(image(), QPoint(5, 5))
+    drain(app)
+    assert app.translator.sent == []
+    assert app.selection_popup.calls[-1][:2] == ("error", NO_JAPANESE_MESSAGE)
+
+
+def test_a_vertical_region_is_rejected_without_translation(monkeypatch, app):
+    class VerticalEngine:
+        def recognize(self, image):
+            return [OcrLine("日本語", 0.99, ((x, 0), (x + 10, 0), (x + 10, 30), (x, 30))) for x in (0, 20, 40)]
+
+    monkeypatch.setattr(ocr, "_ENGINE", VerticalEngine())
+    app._on_screenshot_captured(image(), QPoint(5, 5))
+    drain(app)
+    assert app.translator.sent == []
+    assert app.selection_popup.calls[-1][:2] == ("error", VERTICAL_MESSAGE)
 
 
 def test_an_ocr_failure_shows_an_error_and_the_app_keeps_working(monkeypatch, app):
@@ -156,10 +177,10 @@ def test_an_ocr_failure_shows_an_error_and_the_app_keeps_working(monkeypatch, ap
 
 
 def test_only_the_latest_request_refreshes_the_popup_but_every_result_is_kept_for_history(monkeypatch, app):
-    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["旧"]))
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["旧文"]))
     app._on_screenshot_captured(image(), QPoint(1, 1))
     drain(app)
-    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["新"]))
+    monkeypatch.setattr(ocr, "_ENGINE", FakeEngine(["新文"]))
     app._on_screenshot_captured(image(), QPoint(2, 2))
     drain(app)
     app.selection_popup.calls.clear()
