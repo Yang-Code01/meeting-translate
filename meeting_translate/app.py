@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -482,34 +483,28 @@ class App:
             self._set_status(f"快捷键无效：{e}")
 
     def _register_selection_hotkey(self) -> None:
-        if self.selection_hotkey:
-            self.selection_hotkey.stop()
+        self._register_hotkey_slot("selection_hotkey", self.settings.selection_hotkey, self.bridge.selection_hotkey.emit, "划词翻译")
+
+    def _register_hotkey_slot(self, attr: str, hotkey: str, emit: Callable[[], None], label: str) -> None:
+        """注册 attr 指向的全局快捷键：先停掉旧的，再按 hotkey 新建；错误或无效组合写入状态栏（label 为功能名）。"""
+        current: GlobalHotkey | None = getattr(self, attr)
+        if current:
+            current.stop()
         try:
-            self.selection_hotkey = GlobalHotkey(
-                self.settings.selection_hotkey, self.bridge.selection_hotkey.emit
-            )
-            self.selection_hotkey.start()
-            if self.selection_hotkey.error:
-                self._set_status(self.selection_hotkey.error)
+            registered = GlobalHotkey(hotkey, emit)
+            setattr(self, attr, registered)
+            registered.start()
+            if registered.error:
+                self._set_status(registered.error)
         except ValueError as e:
-            self._set_status(f"划词翻译快捷键无效：{e}")
+            self._set_status(f"{label}快捷键无效：{e}")
 
     def _capture_selection(self) -> None:
         if not self.selection_capture.start():
             self._set_status("正在读取选区，请稍候…")
 
     def _register_screenshot_hotkey(self) -> None:
-        if self.screenshot_hotkey:
-            self.screenshot_hotkey.stop()
-        try:
-            self.screenshot_hotkey = GlobalHotkey(
-                self.settings.screenshot_hotkey, self.bridge.screenshot_hotkey.emit
-            )
-            self.screenshot_hotkey.start()
-            if self.screenshot_hotkey.error:
-                self._set_status(self.screenshot_hotkey.error)
-        except ValueError as e:
-            self._set_status(f"截图翻译快捷键无效：{e}")
+        self._register_hotkey_slot("screenshot_hotkey", self.settings.screenshot_hotkey, self.bridge.screenshot_hotkey.emit, "截图翻译")
 
     def _capture_screenshot(self) -> None:
         # 遮罩已在显示时再次按热键无效果，框选结束后可再次触发
