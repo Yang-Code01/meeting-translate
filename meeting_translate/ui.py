@@ -1478,7 +1478,7 @@ class SettingsDialog(QDialog):
         self._select(self.mic, settings.mic_device if settings.mic_enabled else "__off__")
         self.mic.setToolTip(
             "01 会议实时翻译：选「不翻译麦克风」只翻对方；选设备则把你说的话也识别出来。\n"
-            "03 双向同传：你说的中文从这里采集，翻成日语送给对方。\n"
+            "04 双向同传：你说的中文从这里采集，翻成日语送给对方。\n"
             "必须选真实麦克风（如耳机麦、ジャックマイク），不要选 CABLE / Hi-Fi Cable 等虚拟声卡。\n"
             "「系统默认」跟随 Windows 默认录音设备，它可能被改成了虚拟声卡。"
         )

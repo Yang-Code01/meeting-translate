@@ -1,4 +1,4 @@
-"""三入口主界面：会议字幕、划词翻译、双向语音同传。"""
+"""四入口主界面：会议字幕、划词翻译、双向语音同传。"""
 
 from __future__ import annotations
 
@@ -370,7 +370,7 @@ class ResourceCard(QFrame):
         row.addWidget(self.btn_primary)
         row.addWidget(self.btn_secondary)
         row.addStretch(1)
-        # 右下角角标：只有「03 语音实时转译」才用得到，悬停看说明
+        # 右下角角标：只有「04 语音实时转译」才用得到，悬停看说明
         self.scope_tag: QLabel | None = None
         if duplex_only:
             self.scope_tag = QLabel(DUPLEX_ONLY_TAG)
@@ -610,7 +610,7 @@ class HomeWindow(QWidget):
         self.teams_card.set_state(status)
 
     def set_duplex_blockers(self, blockers: list[str]) -> None:
-        """「03 语音实时转译」的前置依赖没齐时锁住入口。"""
+        """「04 语音实时转译」的前置依赖没齐时锁住入口。"""
         reason = ("需先装好：" + "、".join(blockers) + "（见下方卡片）") if blockers else ""
         self.card_duplex.set_locked(reason)
 

@@ -179,9 +179,9 @@ class App:
         self._model_busy = False
         self._cable_busy = False
         self._runtime_error_code = ""
-        # 虚拟声卡只给「03 语音实时转译」用；本次运行里确认过一次就不再问
+        # 虚拟声卡只给「04 语音实时转译」用；本次运行里确认过一次就不再问
         self._duplex_download_confirmed = False
-        # 03 入口的前置依赖缺什么；None = 还没检测过
+        # 04 入口的前置依赖缺什么；None = 还没检测过
         self._duplex_blockers: list[str] | None = None
         self._model_dialog: ModelDownloadDialog | None = None
         # 正在跑的下载，可以同时多项：行 key → {cancel, text, done, total}
@@ -658,7 +658,7 @@ class App:
             msg.warn(self.overlay if self.overlay.isVisible() else self.home, "Windows 音频服务未运行", AUDIO_SERVICE_HELP)
             self._set_status("Windows 音频服务未运行")
             return
-        # 上次停在「03」、之后依赖被删掉的情况：用快捷键开始也要拦住
+        # 上次停在「04」、之后依赖被删掉的情况：用快捷键开始也要拦住
         if self.settings.meeting_mode == "duplex" and not self._duplex_ready(self.overlay):
             self._set_status("语音实时转译的依赖没装好")
             return
@@ -1455,7 +1455,7 @@ class App:
         self._update_model_dialog()
 
     def _duplex_ready(self, parent) -> bool:
-        """进入 / 开始「03 语音实时转译」前现查一次依赖；缺了就弹窗说明并返回 False。"""
+        """进入 / 开始「04 语音实时转译」前现查一次依赖；缺了就弹窗说明并返回 False。"""
         self._refresh_resources()
         blockers = self._duplex_blockers or []
         if not blockers:
@@ -1463,7 +1463,7 @@ class App:
         msg.info(
             parent,
             "还不能使用语音实时转译",
-            "「03 语音实时转译」需要先装好：" + "、".join(blockers) + "。",
+            "「04 语音实时转译」需要先装好：" + "、".join(blockers) + "。",
             detail="请在首页下方的「语音模型」「虚拟声卡」卡片里下载安装，全部就绪后入口会自动变为可用。\n"
             "「01 会议实时翻译」和「02 划词翻译」不需要这些，可以直接使用。",
         )
@@ -1627,13 +1627,13 @@ class App:
             self.bridge.home_done.emit(tag, False, str(e))
 
     def _confirm_duplex_download(self, what: str) -> bool:
-        """下载前提醒：这些只给「03 语音实时转译」用，避免只用字幕 / 划词的人误下。"""
+        """下载前提醒：这些只给「04 语音实时转译」用，避免只用字幕 / 划词的人误下。"""
         if self._duplex_download_confirmed:
             return True
         self._duplex_download_confirmed = msg.ask(
             self.home,
             "只有语音实时转译需要",
-            f"{what}只给「03 语音实时转译」使用。",
+            f"{what}只给「04 语音实时转译」使用。",
             detail="「01 会议实时翻译」和「02 划词翻译」不需要语音模型、语音运行时和虚拟声卡，可以直接使用。\n"
             "要用语音实时转译才继续。",
             yes="继续",

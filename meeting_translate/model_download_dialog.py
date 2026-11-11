@@ -97,13 +97,13 @@ class ModelDownloadDialog(QDialog):
         title.setObjectName("detailTitle")
         sub = QLabel(
             "运行时与三组模型可以逐项下载，也可以同时下载多项或一次全部下载，随时可以暂停；"
-            "四项全部就绪（再加虚拟声卡）后才能进入「03 语音实时转译」。"
+            "四项全部就绪（再加虚拟声卡）后才能进入「04 语音实时转译」。"
             "模型先走 hf-mirror，失败改走 huggingface.co，每个文件下完核对 SHA256；暂停或中断后点「继续」从断点续传。"
         )
         sub.setObjectName("detailSub")
         sub.setWordWrap(True)
         note = QLabel(
-            "仅「03 语音实时转译」需要。只用「01 会议实时翻译」「02 划词翻译」的话不必下载。"
+            "仅「04 语音实时转译」需要。只用「01 会议实时翻译」「02 划词翻译」的话不必下载。"
             "下载来源与校验方式见首页卡片的「详细」。"
         )
         note.setObjectName("dlgNote")

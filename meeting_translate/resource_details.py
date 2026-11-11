@@ -122,7 +122,7 @@ def models_html(root: Path | str) -> str:
     ]
     return (
         _para(
-            "<span style='color:#e0a45c'>只有「03 语音实时转译」（以及试一句、自检）需要语音模型</span>；"
+            "<span style='color:#e0a45c'>只有「04 语音实时转译」（以及试一句、自检）需要语音模型</span>；"
             "「01 会议实时翻译」和「02 划词翻译」不用下载这些。"
         )
         + _para(
@@ -189,7 +189,7 @@ def models_html(root: Path | str) -> str:
         + _list(
             [
                 "下载完成后卡片变成「运行时与模型已就绪 · 启动时加载」，模型随程序启动加载。",
-                "运行时、模型、虚拟声卡全部就绪后，「03 语音实时转译」的「进入双向同传」才会变为可点。",
+                "运行时、模型、虚拟声卡全部就绪后，「04 语音实时转译」的「进入双向同传」才会变为可点。",
                 "开始同传时后台预热两个引擎，避免第一句卡 20 秒。",
                 "想腾出磁盘空间：直接删掉 melo 与 sbv2 两个引擎目录即可（日文 BERT 在 sbv2 目录下，一并删掉）。",
                 "想放到别的盘：设置环境变量 MEETING_TRANSLATE_TTS_DIR 指向新的模型目录。",
@@ -244,7 +244,7 @@ def cable_html(devices: CableDevices | None, downloads: Path | str, error: str =
     ]
     return (
         _para(
-            "<span style='color:#e0a45c'>只有「03 语音实时转译」需要虚拟声卡</span>；"
+            "<span style='color:#e0a45c'>只有「04 语音实时转译」需要虚拟声卡</span>；"
             "「01 会议实时翻译」环回采集你的扬声器（默认系统扬声器），「02 划词翻译」不碰音频，都不用装。"
         )
         + _para(
