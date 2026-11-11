@@ -897,7 +897,7 @@ class SelectionResultPopup(QWidget):
         )
         self.setObjectName("selectionPopup")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowTitle("划词/句翻译")
+        self.setWindowTitle("划词 / 截图翻译")
         self.setMinimumSize(300, 120)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setStyleSheet(
@@ -928,7 +928,7 @@ class SelectionResultPopup(QWidget):
         self.btn_close.setCursor(Qt.CursorShape.ArrowCursor)
 
         header = QHBoxLayout()
-        self._title = QLabel("划词/句翻译")
+        self._title = QLabel("划词 / 截图翻译")
         header.addWidget(self._title, 1)
         header.addWidget(self.btn_close)
 
