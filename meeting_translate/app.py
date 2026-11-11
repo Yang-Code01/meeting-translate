@@ -26,6 +26,7 @@ from . import message_dialog as msg
 from .asr import AsrEngine, AsrWorker, Final, ModelMissing, create_engine
 from .audio import AUDIO_SERVICE_HELP, ME, THEM, Capture, audio_service_running
 from .audio import is_virtual_device as audio_is_virtual
+from .ocr_layout import RecognitionRejected
 from .config import (
     APP_DIR,
     GLOSSARY_FILE,
@@ -530,11 +531,11 @@ class App:
         )
 
     def _on_screenshot_recognized(self, request_id: int, anchor: QPoint, result) -> None:
+        if isinstance(result, RecognitionRejected):
+            self.result_channel.show_error(request_id, str(result), anchor)
+            return
         if isinstance(result, Exception):
             self.result_channel.show_error(request_id, f"识别失败：{result}", anchor)
-            return
-        if not result:
-            self.result_channel.show_error(request_id, "没有识别到文字", anchor)
             return
         future = self.translator.translate_selected(result, self._active_model(), self.settings.reasoning_effort)
         self._watch(

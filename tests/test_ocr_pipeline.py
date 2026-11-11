@@ -8,9 +8,11 @@ import types
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from meeting_translate import ocr
 from meeting_translate.ocr import OcrLine
+from meeting_translate.ocr_layout import RecognitionRejected
 
 
 class FakeEngine:
@@ -31,14 +33,15 @@ def blank() -> np.ndarray:
     return np.full((20, 40, 3), 255, dtype=np.uint8)
 
 
-def test_recognized_lines_are_joined_in_order_with_newlines():
+def test_recognized_rows_are_joined_in_order_with_newlines():
     engine = FakeEngine([line("こんにちは", 0), line("世界", 10)])
     assert ocr.recognize_text(blank(), engine) == "こんにちは\n世界"
 
 
-def test_blank_lines_are_dropped_and_no_lines_gives_empty_text():
+def test_blank_lines_are_dropped_and_no_lines_is_rejected_before_translation():
     assert ocr.recognize_text(blank(), FakeEngine([line("  ", 0), line("日本語", 10)])) == "日本語"
-    assert ocr.recognize_text(blank(), FakeEngine([])) == ""
+    with pytest.raises(RecognitionRejected):
+        ocr.recognize_text(blank(), FakeEngine([]))
 
 
 def test_recognition_runs_on_a_worker_thread_not_the_caller_thread():
@@ -85,7 +88,7 @@ class ShapeRecordingEngine:
 
     def recognize(self, image):
         self.images.append(image)
-        return []
+        return [line("日本語")]  # 通过 ocr_layout 门槛，使流水线返回而不抛拒绝
 
 
 def solid(w: int, h: int, value: int = 200) -> np.ndarray:
