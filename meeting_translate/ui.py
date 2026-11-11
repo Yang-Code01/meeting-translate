@@ -1624,6 +1624,7 @@ class SettingsDialog(QDialog):
 
         self.hotkey = QLineEdit(settings.hotkey)
         self.selection_hotkey = QLineEdit(settings.selection_hotkey)
+        self.screenshot_hotkey = QLineEdit(settings.screenshot_hotkey)
 
         self.selection_font_family = ChevronFontCombo()
         self.selection_font_family.setCurrentFont(QFont(settings.selection_font_family or "Microsoft YaHei UI"))
@@ -1725,6 +1726,7 @@ class SettingsDialog(QDialog):
         form_ov.addRow("开始/暂停快捷键", self.hotkey)
         form_sel.addRow("字体", self.selection_font_family)
         form_sel.addRow("划词/句翻译快捷键", self.selection_hotkey)
+        form_sel.addRow("截图翻译快捷键", self.screenshot_hotkey)
         form_sel.addRow("中文译文", chinese_row)
         form_sel.addRow("假名", kana_row)
         form_sel.addRow("汉字", kanji_row)
@@ -1855,6 +1857,7 @@ class SettingsDialog(QDialog):
             "subtitle_mode": self.subtitle_mode.isChecked,
             "hotkey": self.hotkey.text,
             "selection_hotkey": self.selection_hotkey.text,
+            "screenshot_hotkey": self.screenshot_hotkey.text,
             "chinese_size": self.chinese_size.value,
             "chinese_color": self.chinese_color.color,
             "kana_size": self.kana_size.value,
@@ -1880,7 +1883,7 @@ class SettingsDialog(QDialog):
         self.selection_font_family.currentFontChanged.connect(self._update_dirty)
         for w in (self.font_color, self.src_font_color, self.chinese_color, self.kana_color, self.kanji_color):
             w.colorChanged.connect(self._update_dirty)
-        for w in (self.fillers, self.fillers_zh, self.hotkey, self.selection_hotkey, self.save_dir):
+        for w in (self.fillers, self.fillers_zh, self.hotkey, self.selection_hotkey, self.screenshot_hotkey, self.save_dir):
             w.textChanged.connect(self._update_dirty)
         for w in (
             self.show_remaining, self.show_used, self.show_meeting,
@@ -2003,6 +2006,7 @@ class SettingsDialog(QDialog):
         self.subtitle_mode.setChecked(d.subtitle_mode)
         self.hotkey.setText(d.hotkey)
         self.selection_hotkey.setText(d.selection_hotkey)
+        self.screenshot_hotkey.setText(d.screenshot_hotkey)
         self.selection_font_family.setCurrentFont(QFont(d.selection_font_family or "Microsoft YaHei UI"))
         self.chinese_size.setValue(d.selection_chinese_px)
         self.chinese_color.set_color(d.selection_chinese_color)
@@ -2283,6 +2287,7 @@ class SettingsDialog(QDialog):
         s.subtitle_mode = self.subtitle_mode.isChecked()
         s.hotkey = self.hotkey.text().strip() or s.hotkey
         s.selection_hotkey = self.selection_hotkey.text().strip() or s.selection_hotkey
+        s.screenshot_hotkey = self.screenshot_hotkey.text().strip() or s.screenshot_hotkey
         s.selection_font_family = self.selection_font_family.currentFont().family()
         s.selection_chinese_px = self.chinese_size.value()
         s.selection_chinese_color = self.chinese_color.color()

@@ -24,7 +24,7 @@ def cfg_path(tmp_path, monkeypatch):
 def test_v2_config_migrates_to_v5_with_copilot_default(cfg_path):
     cfg_path.write_text(json.dumps({"version": 2, "model": "gpt-5.4-mini", "direction": "ja-zh", "font_size": 20}), encoding="utf-8")
     s = config.Settings.load()
-    assert s.version == 5
+    assert s.version == 6
     assert s.provider == "copilot"
     assert s.profiles == []
     assert s.model == "gpt-5.4-mini"  # 旧设置原样保留
@@ -44,7 +44,7 @@ def test_v2_config_migrates_to_v5_with_copilot_default(cfg_path):
 def test_v3_config_adds_duplex_defaults(cfg_path):
     cfg_path.write_text(json.dumps({"version": 3, "model": "gpt-5.4-mini", "meeting_mode": "bad"}), encoding="utf-8")
     s = config.Settings.load()
-    assert s.version == 5
+    assert s.version == 6
     assert s.meeting_mode == "captions"
     assert s.duplex_tts_voice == "koharune_ami"
     assert s.duplex_tts_style == "Neutral"
