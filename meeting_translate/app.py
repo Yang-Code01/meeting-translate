@@ -16,12 +16,12 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
 from PySide6.QtCore import QProcess
 
-from . import duplex_audio, glossary, lang, qtcom, stats, tts_runtime
+from . import duplex_audio, glossary, lang, ocr, qtcom, stats, tts_runtime
 from . import message_dialog as msg
 from .asr import AsrEngine, AsrWorker, Final, ModelMissing, create_engine
 from .audio import AUDIO_SERVICE_HELP, ME, THEM, Capture, audio_service_running
@@ -42,6 +42,7 @@ from .duplex_audio import LivePlayer, PassthroughRouter, Player, resolve_devices
 from .duplex_speech import TtsSpeaker
 from .diagnostics import DiagnosticsDialog
 from .home_ui import HomeWindow
+from .capture import RegionCapture, image_to_rgb_array
 from .hotkey import GlobalHotkey
 from .joiner import Joiner, Pending
 from .model_download_dialog import ModelDownloadDialog, ModelRow
@@ -134,6 +135,7 @@ class App:
         self.bridge.auth.connect(self._on_auth)
         self.bridge.hotkey.connect(self.toggle)
         self.bridge.selection_hotkey.connect(self._capture_selection)
+        self.bridge.screenshot_hotkey.connect(self._capture_screenshot)
         self.bridge.job_done.connect(self._on_job_done)
         self.bridge.usage.connect(self._on_usage)
         self.bridge.progress.connect(self._on_summary_progress)
@@ -192,12 +194,16 @@ class App:
         self.selection_capture = SelectionCapture(self.qapp)
         self.selection_capture.captured.connect(self._on_selection_captured)
         self.selection_capture.failed.connect(self._on_selection_capture_failed)
+        self.screenshot_capture = RegionCapture(self.qapp)
+        self.screenshot_capture.captured.connect(self._on_screenshot_captured)
 
         self._build_tray()
         self.hotkey: GlobalHotkey | None = None
         self._register_hotkey()
         self.selection_hotkey: GlobalHotkey | None = None
         self._register_selection_hotkey()
+        self.screenshot_hotkey: GlobalHotkey | None = None
+        self._register_screenshot_hotkey()
 
         self.translator = Translator(
             on_translation=self.bridge.translated.emit,
@@ -234,6 +240,7 @@ class App:
             self._restore_output_name = pending.name
             QTimer.singleShot(0, self._restore_default_output)
         threading.Thread(target=self._preload_engine, daemon=True).start()
+        threading.Thread(target=self._warm_ocr, daemon=True).start()
         self.home.show()
         self.home.raise_()
         close_splash()
@@ -489,6 +496,57 @@ class App:
     def _capture_selection(self) -> None:
         if not self.selection_capture.start():
             self._set_status("正在读取选区，请稍候…")
+
+    def _register_screenshot_hotkey(self) -> None:
+        if self.screenshot_hotkey:
+            self.screenshot_hotkey.stop()
+        try:
+            self.screenshot_hotkey = GlobalHotkey(
+                self.settings.screenshot_hotkey, self.bridge.screenshot_hotkey.emit
+            )
+            self.screenshot_hotkey.start()
+            if self.screenshot_hotkey.error:
+                self._set_status(self.screenshot_hotkey.error)
+        except ValueError as e:
+            self._set_status(f"截图翻译快捷键无效：{e}")
+
+    def _capture_screenshot(self) -> None:
+        # 遮罩已在显示时再次按热键无效果，框选结束后可再次触发
+        self.screenshot_capture.start()
+
+    def _warm_ocr(self) -> None:
+        try:
+            ocr.warm_up().result()
+        except Exception:
+            log.exception("预热 OCR 模型失败")
+
+    def _on_screenshot_captured(self, image: QImage, anchor: QPoint) -> None:
+        # 与划词共用「最新请求」编号：只有最后一次触发的结果刷新弹窗
+        self._selection_request_id += 1
+        request_id = self._selection_request_id
+        self._latest_selection_request = request_id
+        self.selection_popup.show_loading(anchor)
+        future = ocr.submit_recognition(image_to_rgb_array(image))
+        self._watch(
+            future,
+            ("cb", lambda result: self._on_screenshot_recognized(request_id, anchor, result)),
+        )
+
+    def _on_screenshot_recognized(self, request_id: int, anchor: QPoint, result) -> None:
+        latest = request_id == self._latest_selection_request
+        if isinstance(result, Exception):
+            if latest:
+                self.selection_popup.show_error(f"识别失败：{result}", anchor)
+            return
+        if not result:
+            if latest:
+                self.selection_popup.show_error("没有识别到文字", anchor)
+            return
+        future = self.translator.translate_selected(result, self._active_model(), self.settings.reasoning_effort)
+        self._watch(
+            future,
+            ("cb", lambda translated: self._on_selection_translated(request_id, result, anchor, translated)),
+        )
 
     def _on_selection_capture_failed(self, message: str) -> None:
         self._set_status(message)
@@ -1852,6 +1910,7 @@ class App:
         old_service = self._service_key()
         old_hotkey = self.settings.hotkey
         old_selection_hotkey = self.settings.selection_hotkey
+        old_screenshot_hotkey = self.settings.screenshot_hotkey
         old_model = (self.settings.model, self.settings.reasoning_effort)
         old_mic = self.settings.mic_enabled
         old_engine = (self.settings.effective_engine(), self.settings.asr_language())
@@ -1884,6 +1943,8 @@ class App:
             self._register_hotkey()
         if self.settings.selection_hotkey != old_selection_hotkey:
             self._register_selection_hotkey()
+        if self.settings.screenshot_hotkey != old_screenshot_hotkey:
+            self._register_screenshot_hotkey()
         if self.state == IDLE and (self.settings.effective_engine(), self.settings.asr_language()) != old_engine:
             threading.Thread(target=self._preload_engine, daemon=True).start()
 
@@ -1956,6 +2017,9 @@ class App:
         if self.selection_hotkey:
             self.selection_hotkey.stop()
         self.selection_capture.cancel()
+        if self.screenshot_hotkey:
+            self.screenshot_hotkey.stop()
+        self.screenshot_capture.cancel()
         self.home.hide()
         self.translator.shutdown()
         self.tray.hide()

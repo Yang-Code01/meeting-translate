@@ -2500,6 +2500,7 @@ class Bridge(QObject):
     auth = Signal(object)
     hotkey = Signal()
     selection_hotkey = Signal()
+    screenshot_hotkey = Signal()
     usage = Signal(float)
     progress = Signal(str, int, int)  # 会后整理：(阶段说明, 已完成步数, 总步数)
     duplex_play = Signal(str, str, str)  # (方向, 文本, start|done|direct|clear)
