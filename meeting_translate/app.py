@@ -521,11 +521,8 @@ class App:
             log.exception("预热 OCR 模型失败")
 
     def _on_screenshot_captured(self, image: QImage, anchor: QPoint) -> None:
-        # 与划词共用「最新请求」编号：只有最后一次触发的结果刷新弹窗
-        self._selection_request_id += 1
-        request_id = self._selection_request_id
-        self._latest_selection_request = request_id
-        self.selection_popup.show_loading(anchor)
+        # 与划词共用结果弹窗通道的「最新请求」编号：只有最后一次触发的结果刷新弹窗
+        request_id = self.result_channel.begin(anchor)
         future = ocr.submit_recognition(image_to_rgb_array(image))
         self._watch(
             future,
@@ -533,14 +530,11 @@ class App:
         )
 
     def _on_screenshot_recognized(self, request_id: int, anchor: QPoint, result) -> None:
-        latest = request_id == self._latest_selection_request
         if isinstance(result, Exception):
-            if latest:
-                self.selection_popup.show_error(f"识别失败：{result}", anchor)
+            self.result_channel.show_error(request_id, f"识别失败：{result}", anchor)
             return
         if not result:
-            if latest:
-                self.selection_popup.show_error("没有识别到文字", anchor)
+            self.result_channel.show_error(request_id, "没有识别到文字", anchor)
             return
         future = self.translator.translate_selected(result, self._active_model(), self.settings.reasoning_effort)
         self._watch(

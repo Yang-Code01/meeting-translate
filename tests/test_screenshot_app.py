@@ -17,6 +17,7 @@ import meeting_translate.app as app_module  # noqa: E402
 from meeting_translate import ocr  # noqa: E402
 from meeting_translate.app import App  # noqa: E402
 from meeting_translate.ocr import OcrLine  # noqa: E402
+from meeting_translate.result_channel import ResultChannel  # noqa: E402
 from meeting_translate.translator import SelectionTranslation  # noqa: E402
 
 
@@ -95,8 +96,7 @@ def app(monkeypatch):
     a.selection_popup = FakePopup()
     a.translator = FakeTranslator()
     a._pending_selection_history = []
-    a._selection_request_id = 0
-    a._latest_selection_request = 0
+    a.result_channel = ResultChannel(a.selection_popup)
     a.status_messages: list[str] = []
     a._set_status = a.status_messages.append
     a.watched: list[tuple] = []
