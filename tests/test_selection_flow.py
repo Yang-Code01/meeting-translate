@@ -12,6 +12,7 @@ from PySide6.QtCore import QPoint
 
 from meeting_translate.app import App
 from meeting_translate.config import Settings
+from meeting_translate.result_channel import ResultChannel
 from meeting_translate.translator import SelectionTranslation
 
 
@@ -54,8 +55,7 @@ def make_app() -> App:
     app.translator = FakeTranslator()  # type: ignore[assignment]
     app.tray = FakeTray()  # type: ignore[assignment]
     app._pending_selection_history = []
-    app._selection_request_id = 0
-    app._latest_selection_request = 0
+    app.result_channel = ResultChannel(app.selection_popup)
     app._active_model = lambda: "test-model"  # type: ignore[method-assign]
     app.statuses = []
     app._set_status = app.statuses.append  # type: ignore[method-assign]
