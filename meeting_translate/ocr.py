@@ -8,6 +8,8 @@ from typing import Protocol
 
 import numpy as np
 
+from .ocr_layout import compose_text
+
 # 只能在构造 RapidOCR 时设置：线程数 4、检测边长按 max 限制到 960（混合核 CPU 上避免性能退化）。
 # 不传 lang_type：small 模型对日文与默认配置结果相同。
 OCR_PARAMS = {
@@ -62,9 +64,8 @@ def default_engine() -> OcrEngine:
 
 
 def recognize_text(image: np.ndarray, engine: OcrEngine) -> str:
-    """截图 → 文本：识别行去掉首尾空白后按顺序用换行连接，空行丢弃。引擎异常原样抛出。"""
-    texts = (line.text.strip() for line in engine.recognize(image))
-    return "\n".join(text for text in texts if text)
+    """截图 → 文本：先过质量门槛，再横排排版（见 ocr_layout）。门槛不通过抛 RecognitionRejected；引擎异常原样抛出。"""
+    return compose_text(engine.recognize(image))
 
 
 def submit_recognition(image: np.ndarray, engine: OcrEngine | None = None) -> Future[str]:
