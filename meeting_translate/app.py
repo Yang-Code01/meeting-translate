@@ -46,6 +46,7 @@ from .hotkey import GlobalHotkey
 from .joiner import Joiner, Pending
 from .model_download_dialog import ModelDownloadDialog, ModelRow
 from .resource_details import DetailDialog, cable_html, models_html
+from .result_channel import ResultChannel
 from .selection import SelectionCapture, SelectionRecord, append_history
 from .providers import make_backend
 from .summarize import summarize
@@ -123,8 +124,6 @@ class App:
         self._summary_target: Transcript | None = None
         self._last_output: Path | None = None
         self._pending_selection_history: list[SelectionRecord] = []
-        self._selection_request_id = 0
-        self._latest_selection_request = 0
 
         self.bridge = Bridge()
         self.bridge.partial.connect(self._on_partial)
@@ -189,6 +188,7 @@ class App:
         self.selection_popup = SelectionResultPopup()
         self.selection_popup.apply_style(self.settings)
         self.selection_popup.user_resized.connect(self._save_selection_popup_size)
+        self.result_channel = ResultChannel(self.selection_popup)
         self.selection_capture = SelectionCapture(self.qapp)
         self.selection_capture.captured.connect(self._on_selection_captured)
         self.selection_capture.failed.connect(self._on_selection_capture_failed)
@@ -498,10 +498,7 @@ class App:
     def _on_selection_captured(self, text: str, anchor, warning: str) -> None:
         if warning:
             self._set_status(warning.lstrip("；"))
-        self._selection_request_id += 1
-        request_id = self._selection_request_id
-        self._latest_selection_request = request_id
-        self.selection_popup.show_loading(anchor)
+        request_id = self.result_channel.begin(anchor)
         future = self.translator.translate_selected(text, self._active_model(), self.settings.reasoning_effort)
         self._watch(
             future,
@@ -513,15 +510,12 @@ class App:
 
     def _on_selection_translated(self, request_id: int, source: str, anchor, result) -> None:
         if isinstance(result, Exception):
-            message = f"翻译失败：{result}"
-            if request_id == self._latest_selection_request:
-                self.selection_popup.show_error(message, anchor)
+            self.result_channel.show_error(request_id, f"翻译失败：{result}", anchor)
             self.tray.showMessage("划词翻译失败", str(result), QSystemTrayIcon.MessageIcon.Warning, 5000)
             return
         record = SelectionRecord(datetime.now(), source, result.chinese, result.hiragana)
         self._pending_selection_history.append(record)
-        if request_id == self._latest_selection_request:
-            self.selection_popup.show_result(result.chinese, result.hiragana, anchor)
+        self.result_channel.show_result(request_id, result.chinese, result.hiragana, anchor)
 
     def _save_selection_popup_size(self, width: int, height: int) -> None:
         self.settings.selection_popup_size = [width, height]
