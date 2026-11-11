@@ -50,7 +50,7 @@ def find_model(name: str) -> Path | None:
 
 DEFAULT_FILLERS = ["え", "あ", "えー", "えーと", "あの", "うん", "ん"]
 DEFAULT_FILLERS_ZH = ["嗯", "啊", "呃", "哦", "额", "那个", "就是"]
-SETTINGS_VERSION = 5
+SETTINGS_VERSION = 6
 
 
 @dataclass
@@ -66,6 +66,7 @@ class Settings:
     mic_enabled: bool = False  # 新安装默认关闭，避免旁人说话被记为「我」
     hotkey: str = "Ctrl+Alt+J"
     selection_hotkey: str = "Alt+M"
+    screenshot_hotkey: str = "Alt+N"  # 截图翻译热键（票 01 只配置，票 04 起注册）
     selection_font_family: str = "Microsoft YaHei UI"  # 划词/句翻译弹窗字体
     selection_chinese_px: int = 10  # 划词/句翻译弹窗：中文译文字号（像素）
     selection_kana_px: int = 10  # 划词/句翻译弹窗：假名字号（像素）
@@ -173,6 +174,10 @@ class Settings:
                     data.setdefault("source_font_size", max(9, round(size * 0.75)))
                     data.setdefault("source_font_color", color)
                     data["version"] = 5
+                if data.get("version", 1) < 6:
+                    # v6 新增截图翻译热键，只补默认值，不改动已有字段。
+                    data.setdefault("screenshot_hotkey", "Alt+N")
+                    data["version"] = 6
                 data["version"] = SETTINGS_VERSION
                 s = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
                 if s.meeting_mode not in ("captions", "duplex"):
