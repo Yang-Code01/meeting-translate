@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .ocr import OcrLine
 
-NO_JAPANESE_MESSAGE = "没有识别到日文，请重新框选"
+NOT_RECOGNIZED_MESSAGE = "没有识别到日文，请重新框选"
 VERTICAL_MESSAGE = "竖排文字暂不支持，请框选横向区域"
 
 MIN_CHARS = 2  # 去掉空白后的最少字符数
@@ -27,9 +27,9 @@ def compose_text(lines: Sequence[OcrLine]) -> str:
     """门槛检查后按阅读顺序排版：同一行内按左边界拼接（无分隔符），行与行之间换行。"""
     kept = [line for line in lines if line.text.strip()]
     if not kept or _char_count(kept) < MIN_CHARS:
-        raise RecognitionRejected(NO_JAPANESE_MESSAGE)
+        raise RecognitionRejected(NOT_RECOGNIZED_MESSAGE)
     if sum(line.score for line in kept) / len(kept) < MIN_MEAN_SCORE:
-        raise RecognitionRejected(NO_JAPANESE_MESSAGE)
+        raise RecognitionRejected(NOT_RECOGNIZED_MESSAGE)
 
     bounds = [_bounds(line) for line in kept]
     tall = sum(1 for x0, y0, x1, y1 in bounds if (y1 - y0) > (x1 - x0) * VERTICAL_RATIO)

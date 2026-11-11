@@ -22,13 +22,11 @@ class ResultPopup(Protocol):
 class ResultChannel:
     def __init__(self, popup: ResultPopup) -> None:
         self._popup = popup
-        self._issued = 0
         self._latest = 0
 
     def begin(self, anchor: QPoint) -> int:
         """开始一次新请求：编号设为最新，弹窗进入加载状态，返回编号。"""
-        self._issued += 1
-        self._latest = self._issued
+        self._latest += 1
         self._popup.show_loading(anchor)
         return self._latest
 

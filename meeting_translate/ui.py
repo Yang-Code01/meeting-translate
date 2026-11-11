@@ -90,6 +90,7 @@ MIC_ON_STYLE = (
 )
 DIALOG_GAP = 8
 EDGE_DOUBLE_CLICK = 16  # 双击窗口边缘多少像素内切换全屏
+SELECTION_POPUP_TITLE = "划词 / 截图翻译"  # 划词与截图共用的结果弹窗标题
 
 
 def flexible_combo(combo: QComboBox, chars: int = 12) -> QComboBox:
@@ -897,7 +898,7 @@ class SelectionResultPopup(QWidget):
         )
         self.setObjectName("selectionPopup")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowTitle("划词 / 截图翻译")
+        self.setWindowTitle(SELECTION_POPUP_TITLE)
         self.setMinimumSize(300, 120)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setStyleSheet(
@@ -928,7 +929,7 @@ class SelectionResultPopup(QWidget):
         self.btn_close.setCursor(Qt.CursorShape.ArrowCursor)
 
         header = QHBoxLayout()
-        self._title = QLabel("划词 / 截图翻译")
+        self._title = QLabel(SELECTION_POPUP_TITLE)
         header.addWidget(self._title, 1)
         header.addWidget(self.btn_close)
 

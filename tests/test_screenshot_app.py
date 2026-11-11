@@ -17,7 +17,7 @@ import meeting_translate.app as app_module  # noqa: E402
 from meeting_translate import ocr  # noqa: E402
 from meeting_translate.app import App  # noqa: E402
 from meeting_translate.ocr import OcrLine  # noqa: E402
-from meeting_translate.ocr_layout import NO_JAPANESE_MESSAGE, VERTICAL_MESSAGE  # noqa: E402
+from meeting_translate.ocr_layout import NOT_RECOGNIZED_MESSAGE, VERTICAL_MESSAGE  # noqa: E402
 from meeting_translate.result_channel import ResultChannel  # noqa: E402
 from meeting_translate.translator import SelectionTranslation  # noqa: E402
 
@@ -144,7 +144,7 @@ def test_an_empty_recognition_shows_an_error_and_does_not_translate(monkeypatch,
     app._on_screenshot_captured(image(), QPoint(5, 5))
     drain(app)
     assert app.translator.sent == []
-    assert app.selection_popup.calls[-1] == ("error", NO_JAPANESE_MESSAGE, QPoint(5, 5))
+    assert app.selection_popup.calls[-1] == ("error", NOT_RECOGNIZED_MESSAGE, QPoint(5, 5))
 
 
 def test_a_single_character_recognition_is_rejected_without_translation(monkeypatch, app):
@@ -152,7 +152,7 @@ def test_a_single_character_recognition_is_rejected_without_translation(monkeypa
     app._on_screenshot_captured(image(), QPoint(5, 5))
     drain(app)
     assert app.translator.sent == []
-    assert app.selection_popup.calls[-1][:2] == ("error", NO_JAPANESE_MESSAGE)
+    assert app.selection_popup.calls[-1][:2] == ("error", NOT_RECOGNIZED_MESSAGE)
 
 
 def test_a_vertical_region_is_rejected_without_translation(monkeypatch, app):

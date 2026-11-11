@@ -7,7 +7,7 @@ import pytest
 
 from meeting_translate.ocr import OcrLine
 from meeting_translate.ocr_layout import (
-    NO_JAPANESE_MESSAGE,
+    NOT_RECOGNIZED_MESSAGE,
     VERTICAL_MESSAGE,
     RecognitionRejected,
     compose_text,
@@ -70,19 +70,19 @@ def test_text_inside_a_line_is_stripped_of_surrounding_whitespace():
 
 
 def test_no_lines_is_rejected_as_no_japanese():
-    assert rejected_message([]) == NO_JAPANESE_MESSAGE
+    assert rejected_message([]) == NOT_RECOGNIZED_MESSAGE
 
 
 def test_whitespace_only_text_is_rejected_as_no_japanese():
-    assert rejected_message([box("  ", 0, 0, 30, 10), box("\t", 0, 20, 30, 10)]) == NO_JAPANESE_MESSAGE
+    assert rejected_message([box("  ", 0, 0, 30, 10), box("\t", 0, 20, 30, 10)]) == NOT_RECOGNIZED_MESSAGE
 
 
 def test_a_single_character_is_rejected_as_no_japanese():
-    assert rejected_message([box("日", 0, 0, 30, 10)]) == NO_JAPANESE_MESSAGE
+    assert rejected_message([box("日", 0, 0, 30, 10)]) == NOT_RECOGNIZED_MESSAGE
 
 
 def test_fewer_than_two_characters_after_removing_whitespace_is_rejected():
-    assert rejected_message([box("日 ", 0, 0, 30, 10)]) == NO_JAPANESE_MESSAGE
+    assert rejected_message([box("日 ", 0, 0, 30, 10)]) == NOT_RECOGNIZED_MESSAGE
 
 
 def test_two_characters_are_accepted():
@@ -91,7 +91,7 @@ def test_two_characters_are_accepted():
 
 def test_mean_confidence_below_threshold_is_rejected_as_no_japanese():
     lines = [box("日本語", 0, 0, 30, 10, score=0.3), box("テスト", 0, 20, 30, 10, score=0.5)]
-    assert rejected_message(lines) == NO_JAPANESE_MESSAGE
+    assert rejected_message(lines) == NOT_RECOGNIZED_MESSAGE
 
 
 def test_mean_confidence_is_averaged_over_lines_not_taken_from_the_worst_line():
@@ -145,4 +145,4 @@ def test_recognize_text_applies_the_gates_from_the_engine_output():
 
     with pytest.raises(RecognitionRejected) as info:
         ocr.recognize_text(np.zeros((10, 30, 3), dtype=np.uint8), FakeEngine())
-    assert str(info.value) == NO_JAPANESE_MESSAGE
+    assert str(info.value) == NOT_RECOGNIZED_MESSAGE
