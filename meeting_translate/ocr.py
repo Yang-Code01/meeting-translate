@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage
 
 # 只能在构造 RapidOCR 时设置：线程数 4、检测边长按 max 限制到 960（混合核 CPU 上避免性能退化）。
 # 不传 lang_type：small 模型对日文与默认配置结果相同。
@@ -15,6 +17,38 @@ OCR_PARAMS = {
     "Det.limit_side_len": 960,
     "EngineConfig.onnxruntime.intra_op_num_threads": 4,
 }
+
+
+# 尺寸归一：长边超过 2000 等比缩小；长边小于 400 放大 2 倍；其它不变。只缩放，不锐化、二值化、去噪。
+MAX_LONG_SIDE = 2000
+MIN_LONG_SIDE = 400
+UPSCALE_FACTOR = 2.0
+
+
+def ocr_scale(width: int, height: int) -> float:
+    """按选框尺寸返回缩放因子（1.0 表示不缩放）。"""
+    long_side = max(width, height)
+    if long_side > MAX_LONG_SIDE:
+        return MAX_LONG_SIDE / long_side
+    if long_side < MIN_LONG_SIDE:
+        return UPSCALE_FACTOR
+    return 1.0
+
+
+def normalize_size(image: np.ndarray) -> np.ndarray:
+    """RGB 数组（H, W, 3）按 ocr_scale 缩放；不需要缩放时原样返回。"""
+    h, w = image.shape[:2]
+    scale = ocr_scale(w, h)
+    if scale == 1.0:
+        return image
+    tw, th = max(1, round(w * scale)), max(1, round(h * scale))
+    src = np.ascontiguousarray(image, dtype=np.uint8)
+    qimg = QImage(src.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+    scaled = qimg.scaled(tw, th, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    out = scaled.convertToFormat(QImage.Format.Format_RGB888)
+    bpl = out.bytesPerLine()
+    rows = np.frombuffer(out.constBits(), dtype=np.uint8, count=bpl * th).reshape(th, bpl)
+    return rows[:, : tw * 3].reshape(th, tw, 3).copy()
 
 
 @dataclass(frozen=True)
@@ -63,7 +97,7 @@ def default_engine() -> OcrEngine:
 
 def recognize_text(image: np.ndarray, engine: OcrEngine) -> str:
     """截图 → 文本：识别行去掉首尾空白后按顺序用换行连接，空行丢弃。引擎异常原样抛出。"""
-    texts = (line.text.strip() for line in engine.recognize(image))
+    texts = (line.text.strip() for line in engine.recognize(normalize_size(image)))
     return "\n".join(text for text in texts if text)
 
 
