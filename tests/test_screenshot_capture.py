@@ -149,3 +149,29 @@ def test_a_selection_dragged_across_two_screens_is_stitched_from_both_snapshots(
     assert rgb[0, 19].tolist() == [0, 0, 255]  # 右屏部分
     assert anchor == QPoint(109, 19)
     assert overlays_visible() == []
+
+
+def test_screen_index_at_picks_the_screen_containing_the_point():
+    from meeting_translate.capture import screen_index_at
+
+    geometries = [QRect(-100, 0, 100, 80), QRect(0, 0, 120, 80)]
+    assert screen_index_at(QPoint(-50, 10), geometries) == 0
+    assert screen_index_at(QPoint(60, 10), geometries) == 1
+    assert screen_index_at(QPoint(500, 500), geometries) is None
+
+
+def test_keyboard_focus_follows_the_cursor_to_another_screen(qapp):
+    # Esc 只在持有键盘焦点的遮罩上生效：光标跨屏后焦点必须跟过去
+    left = fake_screen(0, 0, 100, 100, QColor(255, 0, 0))
+    right = fake_screen(100, 0, 100, 100, QColor(0, 0, 255))
+    capture = RegionCapture(snapshot=solid_snapshot, screens=lambda: [left, right])
+    results: list = []
+    capture.cancelled.connect(lambda: results.append("cancelled"))
+    capture.start()
+    left_overlay = next(o for o in overlays_visible() if o.geometry().x() == 0)
+    right_overlay = next(o for o in overlays_visible() if o.geometry().x() == 100)
+    assert capture.focused_overlay is left_overlay
+    right_overlay.moved.emit(QPoint(150, 10))
+    assert capture.focused_overlay is right_overlay
+    QTest.keyClick(right_overlay, Qt.Key.Key_Escape)
+    assert results == ["cancelled"]

@@ -76,6 +76,14 @@ def stitch_images(stitch: Stitch, images: Sequence[QImage]) -> QImage:
     return canvas
 
 
+def screen_index_at(pos: QPoint, geometries: Sequence[QRect]) -> int | None:
+    """光标所在屏幕在列表中的下标；不在任何屏幕上时为 None。"""
+    for index, geometry in enumerate(geometries):
+        if geometry.contains(pos):
+            return index
+    return None
+
+
 def is_drag_selection(rect: QRect) -> bool:
     """宽和高都不小于 _MIN_DRAG_PX 才算有效框选；单击或极小框视为取消。"""
     return rect.width() >= _MIN_DRAG_PX and rect.height() >= _MIN_DRAG_PX
@@ -118,6 +126,8 @@ class RegionOverlay(QWidget):
         self._selection: QRect | None = None  # 全局逻辑坐标
         self.setGeometry(geometry)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        # 不按键也要收到移动事件：光标跨屏时据此把键盘焦点迁到新屏的遮罩
+        self.setMouseTracking(True)
 
     def set_selection(self, rect: QRect | None) -> None:
         self._selection = rect
@@ -174,6 +184,12 @@ class RegionCapture(QObject):
         self._screen_list: list = []
         self._origin: QPoint | None = None
         self._current = QPoint()
+        self._focused_overlay: RegionOverlay | None = None
+
+    @property
+    def focused_overlay(self) -> RegionOverlay | None:
+        """当前持有键盘焦点（因而能接收 Esc）的遮罩。"""
+        return self._focused_overlay
 
     def start(self) -> bool:
         """已有遮罩在显示时返回 False。每块屏幕一个遮罩，覆盖全部显示器。"""
@@ -186,6 +202,7 @@ class RegionCapture(QObject):
         self._pixmaps = pixmaps
         self._origin = None
         self._overlays = []
+        self._focused_overlay = None
         for screen, pixmap in zip(screens, pixmaps):
             overlay = RegionOverlay(pixmap, screen.geometry())
             overlay.pressed.connect(self._on_pressed)
@@ -193,25 +210,27 @@ class RegionCapture(QObject):
             overlay.released.connect(self._on_released)
             overlay.cancelled.connect(self._on_cancelled)
             self._overlays.append(overlay)
-        focus = self._overlay_under_cursor()
+        focus = self._overlay_at(QCursor.pos()) or (self._overlays[0] if self._overlays else None)
         for overlay in self._overlays:
             overlay.show()
-        if focus is not None:
-            focus.raise_()
-            focus.activateWindow()
-            focus.setFocus()
+        self._focus(focus)
         return True
 
     def cancel(self) -> None:
         """静默关闭遮罩（退出程序时使用），不发出 cancelled。"""
         self._close_all()
 
-    def _overlay_under_cursor(self) -> RegionOverlay | None:
-        pos = QCursor.pos()
-        for screen, overlay in zip(self._screen_list, self._overlays):
-            if screen.geometry().contains(pos):
-                return overlay
-        return self._overlays[0] if self._overlays else None
+    def _overlay_at(self, pos: QPoint) -> RegionOverlay | None:
+        index = screen_index_at(pos, [screen.geometry() for screen in self._screen_list])
+        return None if index is None else self._overlays[index]
+
+    def _focus(self, overlay: RegionOverlay | None) -> None:
+        if overlay is None or overlay is self._focused_overlay:
+            return
+        self._focused_overlay = overlay
+        overlay.raise_()
+        overlay.activateWindow()
+        overlay.setFocus()
 
     def _refresh(self) -> None:
         rect = QRect(self._origin, self._current).normalized() if self._origin is not None else None
@@ -224,6 +243,9 @@ class RegionCapture(QObject):
         self._refresh()
 
     def _on_moved(self, pos: QPoint) -> None:
+        overlay = self._overlay_at(pos)
+        if overlay is not None:
+            self._focus(overlay)
         if self._origin is not None:
             self._current = pos
             self._refresh()
@@ -258,6 +280,7 @@ class RegionCapture(QObject):
         self._pixmaps = []
         self._screen_list = []
         self._origin = None
+        self._focused_overlay = None
         for overlay in overlays:
             overlay.hide()
             overlay.close()
