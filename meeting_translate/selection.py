@@ -153,7 +153,9 @@ def _code_block(label: str, value: str) -> str:
     return f"- {label}：\n  {fence}text\n{lines}\n  {fence}\n"
 
 
-_HISTORY_HEADER = "# 划词/句翻译历史\n\n"
+_HISTORY_HEADER = "# 划词 / 截图翻译历史\n\n"
+# 旧版文件头；文件头恰为此行时替换为 _HISTORY_HEADER，已有记录保留
+_LEGACY_HISTORY_TITLE = "# 划词/句翻译历史"
 _SOURCE_BLOCK_RE = re.compile(r"^- 原文：\n  (`{3,})text\n(.*?)\n  \1\n", re.MULTILINE | re.DOTALL)
 
 
@@ -216,11 +218,14 @@ def append_history(path: Path, records: list[SelectionRecord]) -> HistorySaveRes
         seen.add(key)
         new_chunks.append(_format_record(record))
     result = HistorySaveResult(len(new_chunks), len(records) - len(new_chunks), cleaned)
-    if not new_chunks and not cleaned:
+    legacy_head = head.strip() == _LEGACY_HISTORY_TITLE
+    if not new_chunks and not cleaned and not legacy_head:
         return result
 
-    if cleaned or not text.strip():
-        body = (head if head.strip() else _HISTORY_HEADER) + "".join(kept) + "".join(new_chunks)
+    if cleaned or legacy_head or not text.strip():
+        if legacy_head or not head.strip():
+            head = _HISTORY_HEADER
+        body = head + "".join(kept) + "".join(new_chunks)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(body, encoding="utf-8", newline="\n")
         tmp.replace(path)

@@ -90,6 +90,7 @@ MIC_ON_STYLE = (
 )
 DIALOG_GAP = 8
 EDGE_DOUBLE_CLICK = 16  # 双击窗口边缘多少像素内切换全屏
+SELECTION_POPUP_TITLE = "划词 / 截图翻译"  # 划词与截图共用的结果弹窗标题
 
 
 def flexible_combo(combo: QComboBox, chars: int = 12) -> QComboBox:
@@ -897,7 +898,7 @@ class SelectionResultPopup(QWidget):
         )
         self.setObjectName("selectionPopup")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowTitle("划词/句翻译")
+        self.setWindowTitle(SELECTION_POPUP_TITLE)
         self.setMinimumSize(300, 120)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setStyleSheet(
@@ -928,7 +929,7 @@ class SelectionResultPopup(QWidget):
         self.btn_close.setCursor(Qt.CursorShape.ArrowCursor)
 
         header = QHBoxLayout()
-        self._title = QLabel("划词/句翻译")
+        self._title = QLabel(SELECTION_POPUP_TITLE)
         header.addWidget(self._title, 1)
         header.addWidget(self.btn_close)
 
@@ -1478,7 +1479,7 @@ class SettingsDialog(QDialog):
         self._select(self.mic, settings.mic_device if settings.mic_enabled else "__off__")
         self.mic.setToolTip(
             "01 会议实时翻译：选「不翻译麦克风」只翻对方；选设备则把你说的话也识别出来。\n"
-            "03 双向同传：你说的中文从这里采集，翻成日语送给对方。\n"
+            "04 双向同传：你说的中文从这里采集，翻成日语送给对方。\n"
             "必须选真实麦克风（如耳机麦、ジャックマイク），不要选 CABLE / Hi-Fi Cable 等虚拟声卡。\n"
             "「系统默认」跟随 Windows 默认录音设备，它可能被改成了虚拟声卡。"
         )
@@ -1624,6 +1625,7 @@ class SettingsDialog(QDialog):
 
         self.hotkey = QLineEdit(settings.hotkey)
         self.selection_hotkey = QLineEdit(settings.selection_hotkey)
+        self.screenshot_hotkey = QLineEdit(settings.screenshot_hotkey)
 
         self.selection_font_family = ChevronFontCombo()
         self.selection_font_family.setCurrentFont(QFont(settings.selection_font_family or "Microsoft YaHei UI"))
@@ -1725,6 +1727,7 @@ class SettingsDialog(QDialog):
         form_ov.addRow("开始/暂停快捷键", self.hotkey)
         form_sel.addRow("字体", self.selection_font_family)
         form_sel.addRow("划词/句翻译快捷键", self.selection_hotkey)
+        form_sel.addRow("截图翻译快捷键", self.screenshot_hotkey)
         form_sel.addRow("中文译文", chinese_row)
         form_sel.addRow("假名", kana_row)
         form_sel.addRow("汉字", kanji_row)
@@ -1855,6 +1858,7 @@ class SettingsDialog(QDialog):
             "subtitle_mode": self.subtitle_mode.isChecked,
             "hotkey": self.hotkey.text,
             "selection_hotkey": self.selection_hotkey.text,
+            "screenshot_hotkey": self.screenshot_hotkey.text,
             "chinese_size": self.chinese_size.value,
             "chinese_color": self.chinese_color.color,
             "kana_size": self.kana_size.value,
@@ -1880,7 +1884,7 @@ class SettingsDialog(QDialog):
         self.selection_font_family.currentFontChanged.connect(self._update_dirty)
         for w in (self.font_color, self.src_font_color, self.chinese_color, self.kana_color, self.kanji_color):
             w.colorChanged.connect(self._update_dirty)
-        for w in (self.fillers, self.fillers_zh, self.hotkey, self.selection_hotkey, self.save_dir):
+        for w in (self.fillers, self.fillers_zh, self.hotkey, self.selection_hotkey, self.screenshot_hotkey, self.save_dir):
             w.textChanged.connect(self._update_dirty)
         for w in (
             self.show_remaining, self.show_used, self.show_meeting,
@@ -2003,6 +2007,7 @@ class SettingsDialog(QDialog):
         self.subtitle_mode.setChecked(d.subtitle_mode)
         self.hotkey.setText(d.hotkey)
         self.selection_hotkey.setText(d.selection_hotkey)
+        self.screenshot_hotkey.setText(d.screenshot_hotkey)
         self.selection_font_family.setCurrentFont(QFont(d.selection_font_family or "Microsoft YaHei UI"))
         self.chinese_size.setValue(d.selection_chinese_px)
         self.chinese_color.set_color(d.selection_chinese_color)
@@ -2283,6 +2288,7 @@ class SettingsDialog(QDialog):
         s.subtitle_mode = self.subtitle_mode.isChecked()
         s.hotkey = self.hotkey.text().strip() or s.hotkey
         s.selection_hotkey = self.selection_hotkey.text().strip() or s.selection_hotkey
+        s.screenshot_hotkey = self.screenshot_hotkey.text().strip() or s.screenshot_hotkey
         s.selection_font_family = self.selection_font_family.currentFont().family()
         s.selection_chinese_px = self.chinese_size.value()
         s.selection_chinese_color = self.chinese_color.color()
@@ -2495,6 +2501,7 @@ class Bridge(QObject):
     auth = Signal(object)
     hotkey = Signal()
     selection_hotkey = Signal()
+    screenshot_hotkey = Signal()
     usage = Signal(float)
     progress = Signal(str, int, int)  # 会后整理：(阶段说明, 已完成步数, 总步数)
     duplex_play = Signal(str, str, str)  # (方向, 文本, start|done|direct|clear)

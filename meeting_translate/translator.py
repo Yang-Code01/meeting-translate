@@ -302,7 +302,7 @@ class Translator:
         return self._call(self._benchmark(model, effort, direction))
 
     def translate_selected(self, text: str, model: str, effort: str) -> concurrent.futures.Future:
-        """Future[SelectionTranslation]：在隔离的一次性会话中翻译选中的日文。"""
+        """Future[SelectionTranslation]：在划词翻译会话上翻译选中的日文（与 _selection_lock 串行；截图翻译的 OCR 文本也走这里，与划词共用同一条会话）。"""
         return self._call(self._translate_selected(text, model, effort))
 
     def prepare_selection(self, model: str, effort: str) -> concurrent.futures.Future:

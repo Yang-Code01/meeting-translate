@@ -4,13 +4,14 @@
 
 [![CI](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml/badge.svg)](https://github.com/Yang-Code01/meeting-translate/actions/workflows/ci.yml)
 
-A small Windows desktop tool with three features:
+A small Windows desktop tool with four entry points (numbered as on the home screen):
 
-- **Live meeting translation** — it listens to **any meeting app** (the system loopback is treated as *them*, your microphone as *you*), runs speech recognition locally, translates with GitHub Copilot or your own OpenAI-compatible endpoint, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
-- **Selection translation** — select a piece of Japanese text in any application and press **Alt+M**: a popup next to the cursor shows the Chinese translation and the original annotated with furigana. It runs on a separate, pre-warmed session, so it never interrupts a meeting.
-- **Voice interpretation** (Beta) — two-way speech: you speak Chinese and the other side hears Japanese in the meeting; they speak Japanese and you hear Chinese in your headphones. Recognition and synthesis run locally, with audio routed through VB-Audio virtual cables.
+- **01 Live meeting translation** — it listens to **any meeting app** (the system loopback is treated as *them*, your microphone as *you*), runs speech recognition locally, translates with GitHub Copilot or your own OpenAI-compatible endpoint, and shows bilingual Japanese/Chinese subtitles in an always-on-top overlay. When the meeting ends it can produce cleaned-up minutes, action items and a bilingual transcript.
+- **02 Selection translation** — select a piece of Japanese text in any application and press **Alt+M**: a popup next to the cursor shows the Chinese translation and the original annotated with furigana. It runs on a separate, pre-warmed session, so it never interrupts a meeting.
+- **03 Screenshot translation** — press **Alt+N** (configurable), drag a box over a Japanese region of the screen (web images, non-selectable PDFs and app UIs all work). Local OCR (RapidOCR; its models are bundled, nothing extra to download) reads the text, your translation model translates it, and the result pops up next to the selection. It shares the popup, translation session and history file with selection translation.
+- **04 Voice interpretation** (Beta) — two-way speech: you speak Chinese and the other side hears Japanese in the meeting; they speak Japanese and you hear Chinese in your headphones. Recognition and synthesis run locally, with audio routed through VB-Audio virtual cables.
 
-No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work). The first two features need no virtual audio cable, and speech recognition runs entirely on your CPU — only text is sent to Copilot.
+No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work). The first three entries (01–03) need no virtual audio cable; speech recognition and screenshot OCR run entirely on your machine. Only recognized text is sent to your model service — screenshot translation never uploads the image.
 
 ## Requirements
 
@@ -26,7 +27,7 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work). Th
 
 ### Option 1: Download the packaged exe
 
-1. Grab `MeetingTranslate.exe` (about 400 MB, with recognition models and the Copilot runtime bundled) from [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest).
+1. Grab `MeetingTranslate.exe` (about 520 MB, with recognition models, OCR models, and the Copilot runtime bundled) from [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest).
 2. Run it. The first launch unpacks bundled resources (~15 s, with a splash screen); a 「译」 tray icon appears when ready.
 3. Log in to Copilot on first use — see [Sign in](#sign-in-to-copilot) — or enter your own API key in Settings.
 
@@ -83,6 +84,16 @@ An unauthenticated launch shows a guide with two options:
 
 ## Usage
 
+### Shortcuts
+
+| Feature | Default | config.json key |
+|---|---|---|
+| 01 Live meeting translation: start / pause | Ctrl+Alt+J | `hotkey` |
+| 02 Selection translation | Alt+M | `selection_hotkey` |
+| 03 Screenshot translation | Alt+N | `screenshot_hotkey` |
+
+All of these can be changed in settings. Voice interpretation has no separate global hotkey.
+
 ### Running a meeting
 
 1. Press **Ctrl+Alt+J** (or use the tray menu / the “▶ 开始” button) to start; press again to pause, “▶ 继续” to resume.
@@ -117,6 +128,17 @@ Select a piece of Japanese text in **any application** and press **Alt+M** (conf
 - Records accumulate in memory; clicking “保存划词/句翻译历史” in settings writes them to `selection_translation_history.md` (deduplicated).
 
 > How it works: the hotkey triggers an emulated Ctrl+C to read the current selection, then restores your previous clipboard. So **select the text first, then press the hotkey**.
+
+### Screenshot translation (Alt+N)
+
+Press **Alt+N** (configurable): the screen dims, then drag a box over a Japanese region. Release the mouse and it is recognized and translated; the result pops up beside the selection.
+
+- **No extra download**: OCR uses RapidOCR's built-in models, shipped with the program; recognition runs locally and works offline.
+- The recognized text goes to your chosen translation model, just like selection translation; the image itself is never sent.
+- The result popup, translation session and history are shared with selection translation. Records also go to `selection_translation_history.md`, written only after you click “保存划词/句翻译历史” in settings.
+- Press Esc to cancel. A plain click without dragging a region also cancels.
+- Only horizontal Japanese is supported: a vertical block shows “竖排文字暂不支持，请框选横向区域”, and if no Japanese is found the popup says why.
+- If the hotkey is taken by another program, you get a conflict notice; change it in settings.
 
 ### Voice interpretation (two-way)
 
@@ -195,7 +217,7 @@ Everything lives in `%APPDATA%\meeting-translate\` and is never uploaded:
 | `config.json` | settings (API keys for custom endpoints are stored here, encrypted with Windows DPAPI) |
 | `model_stats.json` | measured latency and past meeting usage (for cost estimates) |
 | `glossary.txt` | glossary |
-| `selection_translation_history.md` | selection-translation history (written only when saved) |
+| `selection_translation_history.md` | selection- and screenshot-translation history (written only when saved) |
 | `transcripts\` | temporary records during a meeting; default location when no save folder is set |
 | `models\` | optionally downloaded models (not needed with the exe); `models\tts\` holds the speech models |
 | `runtime\sbv2\` | speech runtime (standalone Python 3.12 environment managed by uv) |
@@ -216,10 +238,11 @@ After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<t
 ## Known limitations
 
 - Windows only: capture relies on WASAPI loopback; no cross-platform plans.
+- Screenshot translation only recognizes horizontal Japanese; vertical text is rejected with a notice, and errors on handwriting or unusual characters are a known limitation.
 - The default Copilot path needs a subscription and is billed in AIC / requests; a custom endpoint is billed in tokens, with the quota set by the provider.
 - The default SenseVoice engine has no hotword support; switch to ReazonSpeech (slower) if you need it.
 - Speaker separation only distinguishes *them* / *you*; multiple people in one room are not separated.
-- The exe is ~400 MB and needs unpacking on launch (~15 s on first run).
+- The exe is ~520 MB and needs unpacking on launch (~15 s on first run).
 - Pausing force-finalizes the current sentence, so pausing mid-sentence can truncate it.
 
 ## Technical notes
@@ -228,7 +251,7 @@ After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<t
 - **Join unfinished sentences** — silence-only splitting shreds 「〜ですが／〜ので」, so a second layer adds Japanese sentence-end detection, a 3 s wait and a 20 s merge ceiling, then translates and displays the merged text as one line.
 - **One request, two jobs** — the model corrects ASR errors and translates in the same response, costing no extra requests; the corrected source replaces the raw ASR text everywhere.
 - **Visible cost** — measured latency and AIC prices are folded into an “AIC/hour” estimate per model, and any model can be benchmarked in place.
-- **Isolated selection session** — selection translation runs on its own pre-warmed session, so it never disturbs meeting translation.
+- **Isolated selection session** — selection translation runs on its own pre-warmed session, so it never disturbs meeting translation. Screenshot translation shares that session.
 
 ## Development
 

@@ -1,4 +1,4 @@
-"""三入口主界面：会议字幕、划词翻译、双向语音同传。"""
+"""四入口主界面：会议字幕、划词翻译、双向语音同传。"""
 
 from __future__ import annotations
 
@@ -41,6 +41,16 @@ QFrame#modeCard:hover { background: #1b1f29; border-color: #4b6dff; }
 QFrame#modeCard[accent="true"] { background: #171c2a; border-color: #3b5fe0; }
 QFrame#modeCard[active="true"] { border-color: #5b8cff; }
 QLabel#modeNumber { color: #667089; font-size: 11px; font-weight: 700; }
+QFrame#comboCard {
+    background: #171a21; border: 1px solid #272d3a; border-radius: 18px;
+}
+QFrame#shortcutCard { background: #1d2230; border: 1px solid #2c3446; border-radius: 12px; }
+QFrame#shortcutCard:hover { border-color: #4b6dff; }
+QFrame#shortcutCard QLabel#modeTitle { font-size: 16px; }
+QLabel#shortcutChip {
+    color: #9fb2d9; background: #121722; border: 1px dashed #3a4a6b;
+    border-radius: 8px; padding: 4px 8px; font-size: 11px; font-weight: 500;
+}
 QLabel#modeTitle { color: #f4f6fb; font-size: 20px; font-weight: 700; }
 QLabel#modeDesc { color: #aeb7c9; font-size: 13px; }
 QLabel#modeBullets { color: #7f8aa1; font-size: 12px; }
@@ -96,7 +106,7 @@ QToolTip {
 """
 
 DUPLEX_ONLY_TAG = "语音转换 Only"
-DUPLEX_ONLY_TIP = "仅「03 语音实时转译」需要。\n只用「01 会议实时翻译」「02 划词翻译」不必下载、安装或配置。"
+DUPLEX_ONLY_TIP = "仅 04 语音实时转译需要，只用 01、02、03 不必下载、安装或配置。"
 
 SLOGANS = (
     "言通中日，语达八方。",
@@ -272,6 +282,42 @@ class ModeCard(QFrame):
         super().mouseReleaseEvent(e)
 
 
+class ShortcutCard(QFrame):
+    """大卡片里的小卡：编号、标题、一句说明、快捷键标签；没有要点列表，也不绑定按钮。"""
+
+    def __init__(self, number: str, title: str, description: str, *, hotkey: str = "") -> None:
+        super().__init__()
+        self.setObjectName("shortcutCard")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        num = QLabel(number)
+        num.setObjectName("modeNumber")
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName("modeTitle")
+        self._hotkey = QLabel()
+        self._hotkey.setObjectName("shortcutChip")
+        self._hotkey.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.set_hotkey(hotkey)
+        desc = QLabel(description)
+        desc.setObjectName("modeDesc")
+        desc.setWordWrap(True)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.addWidget(num)
+        top.addWidget(title_lbl)
+        top.addStretch(1)
+        top.addWidget(self._hotkey)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
+        lay.addLayout(top)
+        lay.addWidget(desc)
+        lay.addStretch(1)
+
+    def set_hotkey(self, hotkey: str) -> None:
+        self._hotkey.setText(f"快捷键  {hotkey}")
+
+
 class ResourceCard(QFrame):
     """首页底部的一张资源卡：模型、虚拟声卡、会议软件配置。"""
 
@@ -324,7 +370,7 @@ class ResourceCard(QFrame):
         row.addWidget(self.btn_primary)
         row.addWidget(self.btn_secondary)
         row.addStretch(1)
-        # 右下角角标：只有「03 语音实时转译」才用得到，悬停看说明
+        # 右下角角标：只有「04 语音实时转译」才用得到，悬停看说明
         self.scope_tag: QLabel | None = None
         if duplex_only:
             self.scope_tag = QLabel(DUPLEX_ONLY_TAG)
@@ -374,7 +420,7 @@ class ResourceCard(QFrame):
 
 
 class HomeWindow(QWidget):
-    """三入口主界面。"""
+    """四入口主界面：会议字幕、划词与截图（大卡片内两张小卡）、双向语音同传。"""
 
     mode_selected = Signal(str)
     selection_requested = Signal()
@@ -444,7 +490,7 @@ class HomeWindow(QWidget):
 
         question = SloganLabel()
         question.setObjectName("question")
-        question_sub = QLabel("三种入口共用同一套模型、术语表与记录目录；进入后可在悬浮窗里开始或结束会话。")
+        question_sub = QLabel("四种入口共用术语表与记录目录；进入后可在悬浮窗里开始或结束会话。")
         question_sub.setObjectName("questionSub")
         question_sub.setWordWrap(True)
 
@@ -455,15 +501,30 @@ class HomeWindow(QWidget):
             ["环回采集会议声音", "中日字幕 + 会后纪要", "不改变会议里的声音"],
             "进入会议字幕",
         )
-        self.card_selection = ModeCard(
+        self.card_selection = ShortcutCard(
             "02",
             "划词翻译",
             "鼠标选中词语或者句子，按下快捷键，进入翻译。支持英语、日语转换为中文。",
-            ["全局快捷键直接触发", "中文 + 汉字注音", "自动保存划词历史"],
             hotkey=settings.selection_hotkey,
         )
-        self.card_duplex = ModeCard(
+        self.card_screenshot = ShortcutCard(
             "03",
+            "截图翻译",
+            "框选屏幕上的日文区域，识别后翻译成中文。",
+            hotkey=settings.screenshot_hotkey,
+        )
+        # 划词与截图合并为一张大卡片（无标题），占原 02 卡片所在的列
+        self.card_combo = QFrame()
+        self.card_combo.setObjectName("comboCard")
+        self.card_combo.setMinimumHeight(292)
+        self.card_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        combo_lay = QVBoxLayout(self.card_combo)
+        combo_lay.setContentsMargins(12, 12, 12, 12)
+        combo_lay.setSpacing(12)
+        combo_lay.addWidget(self.card_selection, 1)
+        combo_lay.addWidget(self.card_screenshot, 1)
+        self.card_duplex = ModeCard(
+            "04",
             "语音实时转译",
             "你说中文，对方听到日语；对方说日语，你听到中文。会议软件以 Teams 为例：扬声器选 CABLE Input、麦克风选 Hi-Fi Cable Output；Zoom、腾讯会议等改法相同。",
             ["双向语音同传", "CABLE + Hi-Fi 路由", "字幕与纪要保留"],
@@ -478,7 +539,7 @@ class HomeWindow(QWidget):
 
         cards = QHBoxLayout()
         cards.setSpacing(16)
-        for c in (self.card_meeting, self.card_selection, self.card_duplex):
+        for c in (self.card_meeting, self.card_combo, self.card_duplex):
             cards.addWidget(c, 1)
 
         self.model_card = ResourceCard(
@@ -549,7 +610,7 @@ class HomeWindow(QWidget):
         self.teams_card.set_state(status)
 
     def set_duplex_blockers(self, blockers: list[str]) -> None:
-        """「03 语音实时转译」的前置依赖没齐时锁住入口。"""
+        """「04 语音实时转译」的前置依赖没齐时锁住入口。"""
         reason = ("需先装好：" + "、".join(blockers) + "（见下方卡片）") if blockers else ""
         self.card_duplex.set_locked(reason)
 
@@ -558,6 +619,7 @@ class HomeWindow(QWidget):
             f"会议快捷键  {settings.hotkey}    ·    全局划词  {settings.selection_hotkey}"
         )
         self.card_selection.set_hotkey(settings.selection_hotkey)
+        self.card_screenshot.set_hotkey(settings.screenshot_hotkey)
         self.set_mode(settings.meeting_mode)
 
     def set_mode(self, mode: str) -> None:
