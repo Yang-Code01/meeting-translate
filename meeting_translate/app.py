@@ -1919,15 +1919,15 @@ class App:
         custom = dlg.provider.currentData() == "openai"
 
         fields = (
-            ("hotkey", "会议实时翻译"),
-            ("selection_hotkey", "划词翻译"),
-            ("screenshot_hotkey", "截图翻译"),
+            ("hotkey", "会议实时翻译", self.bridge.hotkey.emit),
+            ("selection_hotkey", "划词翻译", self.bridge.selection_hotkey.emit),
+            ("screenshot_hotkey", "截图翻译", self.bridge.screenshot_hotkey.emit),
         )
         hotkeys: dict[str, str] = {}
         combinations: dict[str, tuple[int, int] | None] = {}
         changed: set[str] = set()
         errors: list[str] = []
-        for field, label in fields:
+        for field, label, _emit in fields:
             requested = getattr(dlg, field).text().strip() or old_hotkeys[field]
             try:
                 combination = parse_hotkey(requested)
@@ -1949,8 +1949,8 @@ class App:
             combinations[field] = combination
 
         conflicts: list[str] = []
-        for index, (first, first_label) in enumerate(fields):
-            for second, second_label in fields[index + 1 :]:
+        for index, (first, first_label, _first_emit) in enumerate(fields):
+            for second, second_label, _second_emit in fields[index + 1 :]:
                 if (
                     combinations[first] is not None
                     and combinations[first] == combinations[second]
@@ -1965,19 +1965,15 @@ class App:
             )
             return False
 
-        registrations = {
-            "hotkey": ("hotkey", self.bridge.hotkey.emit, "会议实时翻译"),
-            "selection_hotkey": ("selection_hotkey", self.bridge.selection_hotkey.emit, "划词翻译"),
-            "screenshot_hotkey": ("screenshot_hotkey", self.bridge.screenshot_hotkey.emit, "截图翻译"),
-        }
+        operations = {field: (label, emit) for field, label, emit in fields}
         active_combinations: dict[str, tuple[int, int]] = {}
-        for field, (attr, _emit, _label) in registrations.items():
-            if getattr(self, attr) is not None:
+        for field, _label, _emit in fields:
+            if getattr(self, field) is not None:
                 try:
                     active_combinations[field] = parse_hotkey(old_hotkeys[field])
                 except ValueError:
                     pass
-        pending = [field for field, _label in fields if field in changed]
+        pending = [field for field, _label, _emit in fields if field in changed]
         while pending:
             ready = next(
                 (
@@ -1991,8 +1987,8 @@ class App:
                 None,
             )
             field = ready or pending[0]  # 组合交换形成循环时，系统注册会拒绝；逐项保留旧值。
-            attr, emit, label = registrations[field]
-            error = self._replace_hotkey(attr, hotkeys[field], emit, label)
+            label, emit = operations[field]
+            error = self._replace_hotkey(field, hotkeys[field], emit, label)
             if error:
                 errors.append(f"{error}；已保留原设置 {old_hotkeys[field]}")
                 hotkeys[field] = old_hotkeys[field]
