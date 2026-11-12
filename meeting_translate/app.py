@@ -45,7 +45,7 @@ from .duplex_speech import TtsSpeaker
 from .diagnostics import DiagnosticsDialog
 from .home_ui import HomeWindow
 from .capture import RegionCapture, image_to_rgb_array
-from .hotkey import GlobalHotkey
+from .hotkey import GlobalHotkey, parse as parse_hotkey
 from .joiner import Joiner, Pending
 from .model_download_dialog import ModelDownloadDialog, ModelRow
 from .resource_details import DetailDialog, cable_html, models_html
@@ -472,32 +472,47 @@ class App:
         QTimer.singleShot(250, self._capture_selection)
 
     def _register_hotkey(self) -> None:
-        if self.hotkey:
-            self.hotkey.stop()
-        try:
-            self.hotkey = GlobalHotkey(self.settings.hotkey, self.bridge.hotkey.emit)
-            self.hotkey.start()
-            if self.hotkey.error:
-                self._set_status(self.hotkey.error)
-        except ValueError as e:
-            self._set_status(f"快捷键无效：{e}")
+        error = self._replace_hotkey("hotkey", self.settings.hotkey, self.bridge.hotkey.emit, "会议实时翻译")
+        if error:
+            self._set_status(error)
 
     def _register_selection_hotkey(self) -> None:
         self._register_hotkey_slot("selection_hotkey", self.settings.selection_hotkey, self.bridge.selection_hotkey.emit, "划词翻译")
 
-    def _register_hotkey_slot(self, attr: str, hotkey: str, emit: Callable[[], None], label: str) -> None:
-        """注册 attr 指向的全局快捷键：先停掉旧的，再按 hotkey 新建；错误或无效组合写入状态栏（label 为功能名）。"""
+    def _register_hotkey_slot(self, attr: str, hotkey: str, emit: Callable[[], None], label: str) -> str | None:
+        error = self._replace_hotkey(attr, hotkey, emit, label)
+        if error:
+            self._set_status(error)
+        return error
+
+    def _replace_hotkey(self, attr: str, hotkey: str, emit: Callable[[], None], label: str) -> str | None:
+        """先确认新快捷键可注册，再停止旧快捷键，避免注册失败时丢失可用配置。"""
+        registered: GlobalHotkey | None = None
+        try:
+            registered = GlobalHotkey(hotkey, emit)
+            registered.start()
+        except ValueError as e:
+            if registered is not None:
+                try:
+                    registered.stop()
+                except Exception:  # noqa: BLE001
+                    log.exception("停止未注册的快捷键线程失败")
+            return f"{label}快捷键 {hotkey} 无效：{e}"
+        except Exception as e:  # noqa: BLE001
+            if registered is not None:
+                try:
+                    registered.stop()
+                except Exception:  # noqa: BLE001
+                    log.exception("停止未注册的快捷键线程失败")
+            return f"{label}快捷键 {hotkey} 注册失败：{e}"
+        if registered.error:
+            return f"{label}快捷键注册失败：{registered.error}"
+
         current: GlobalHotkey | None = getattr(self, attr)
         if current:
             current.stop()
-        try:
-            registered = GlobalHotkey(hotkey, emit)
-            setattr(self, attr, registered)
-            registered.start()
-            if registered.error:
-                self._set_status(registered.error)
-        except ValueError as e:
-            self._set_status(f"{label}快捷键无效：{e}")
+        setattr(self, attr, registered)
+        return None
 
     def _capture_selection(self) -> None:
         if not self.selection_capture.start():
@@ -1880,7 +1895,7 @@ class App:
 
         dlg._on_refresh = refresh
         dlg._on_bench = bench
-        dlg.accepted.connect(lambda: self._apply_settings(dlg))
+        dlg.save_requested.connect(lambda: self._apply_settings(dlg))
         dlg.quit_requested.connect(self.quit)
         dlg.finished.connect(closed)
         dlg.set_meeting_active(self.state != IDLE)
@@ -1890,17 +1905,98 @@ class App:
         dlg.raise_()
         dlg.activateWindow()
 
-    def _apply_settings(self, dlg: SettingsDialog) -> None:
+    def _apply_settings(self, dlg: SettingsDialog) -> bool:
         old_service = self._service_key()
-        old_hotkey = self.settings.hotkey
-        old_selection_hotkey = self.settings.selection_hotkey
-        old_screenshot_hotkey = self.settings.screenshot_hotkey
+        old_hotkeys = {
+            "hotkey": self.settings.hotkey,
+            "selection_hotkey": self.settings.selection_hotkey,
+            "screenshot_hotkey": self.settings.screenshot_hotkey,
+        }
         old_model = (self.settings.model, self.settings.reasoning_effort)
         old_mic = self.settings.mic_enabled
         old_engine = (self.settings.effective_engine(), self.settings.asr_language())
         new_model = (dlg.model.currentData() or self.settings.model, dlg.effort.currentText())
         custom = dlg.provider.currentData() == "openai"
-        dlg.apply()
+
+        fields = (
+            ("hotkey", "会议实时翻译", self.bridge.hotkey.emit),
+            ("selection_hotkey", "划词翻译", self.bridge.selection_hotkey.emit),
+            ("screenshot_hotkey", "截图翻译", self.bridge.screenshot_hotkey.emit),
+        )
+        hotkeys: dict[str, str] = {}
+        combinations: dict[str, tuple[int, int] | None] = {}
+        changed: set[str] = set()
+        errors: list[str] = []
+        for field, label, _emit in fields:
+            requested = getattr(dlg, field).text().strip() or old_hotkeys[field]
+            try:
+                combination = parse_hotkey(requested)
+            except ValueError as e:
+                errors.append(f"{label}快捷键 {requested} 无效，已保留原设置 {old_hotkeys[field]}：{e}")
+                requested = old_hotkeys[field]
+                try:
+                    combination = parse_hotkey(requested)
+                except ValueError:
+                    combination = None
+            else:
+                try:
+                    old_combination = parse_hotkey(old_hotkeys[field])
+                except ValueError:
+                    old_combination = None
+                if combination != old_combination:
+                    changed.add(field)
+            hotkeys[field] = requested
+            combinations[field] = combination
+
+        conflicts: list[str] = []
+        for index, (first, first_label, _first_emit) in enumerate(fields):
+            for second, second_label, _second_emit in fields[index + 1 :]:
+                if (
+                    combinations[first] is not None
+                    and combinations[first] == combinations[second]
+                    and (first in changed or second in changed)
+                ):
+                    conflicts.append(f"{first_label}与{second_label}")
+        if conflicts:
+            msg.warn(
+                dlg,
+                "快捷键冲突",
+                "以下功能的快捷键组合相同：" + "；".join(conflicts) + "。本次设置未保存，请修改后重试。",
+            )
+            return False
+
+        operations = {field: (label, emit) for field, label, emit in fields}
+        active_combinations: dict[str, tuple[int, int]] = {}
+        for field, _label, _emit in fields:
+            if getattr(self, field) is not None:
+                try:
+                    active_combinations[field] = parse_hotkey(old_hotkeys[field])
+                except ValueError:
+                    pass
+        pending = [field for field, _label, _emit in fields if field in changed]
+        while pending:
+            ready = next(
+                (
+                    field
+                    for field in pending
+                    if not any(
+                        other != field and combination == combinations[field]
+                        for other, combination in active_combinations.items()
+                    )
+                ),
+                None,
+            )
+            field = ready or pending[0]  # 组合交换形成循环时，系统注册会拒绝；逐项保留旧值。
+            label, emit = operations[field]
+            error = self._replace_hotkey(field, hotkeys[field], emit, label)
+            if error:
+                errors.append(f"{error}；已保留原设置 {old_hotkeys[field]}")
+                hotkeys[field] = old_hotkeys[field]
+            else:
+                active_combinations[field] = combinations[field]
+            pending.remove(field)
+
+        dlg.apply(hotkeys=hotkeys)
         if not self.settings.show_overlay:
             self.overlay.hide()
         elif self.state != IDLE:
@@ -1923,14 +2019,12 @@ class App:
         if not custom and new_model != old_model:
             self.settings.model, self.settings.reasoning_effort = old_model
             self.set_model(*new_model)
-        if self.settings.hotkey != old_hotkey:
-            self._register_hotkey()
-        if self.settings.selection_hotkey != old_selection_hotkey:
-            self._register_selection_hotkey()
-        if self.settings.screenshot_hotkey != old_screenshot_hotkey:
-            self._register_screenshot_hotkey()
         if self.state == IDLE and (self.settings.effective_engine(), self.settings.asr_language()) != old_engine:
             threading.Thread(target=self._preload_engine, daemon=True).start()
+        if errors:
+            msg.warn(dlg, "快捷键未应用", "\n".join(errors))
+        dlg.accept()
+        return True
 
     def _service_key(self) -> tuple:
         """服务商 + 端点配置的指纹：变了就要换后端。"""
