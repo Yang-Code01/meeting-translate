@@ -79,6 +79,19 @@ def test_settings_dialog_shows_and_saves_screenshot_hotkey(cfg_path, qapp):
     dlg.deleteLater()
 
 
+def test_save_button_requests_application_without_closing_dialog(cfg_path, qapp):
+    dlg = SettingsDialog(Settings(), [])
+    requests = []
+    dlg.save_requested.connect(lambda: requests.append("save"))
+    dlg.show()
+
+    dlg.btn_save.click()
+
+    assert requests == ["save"]
+    assert dlg.isVisible()
+    dlg.close()
+
+
 def test_settings_dialog_blank_screenshot_hotkey_keeps_previous(cfg_path, qapp):
     s = Settings(screenshot_hotkey="Alt+P")
     dlg = SettingsDialog(s, [])

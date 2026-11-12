@@ -1404,6 +1404,7 @@ QToolTip { background: #171a21; color: #e7ecf5; border: 1px solid #2a3040; paddi
 
 class SettingsDialog(QDialog):
     quit_requested = Signal()
+    save_requested = Signal()
 
     def __init__(
         self,
@@ -1802,7 +1803,7 @@ class SettingsDialog(QDialog):
         self.btn_save = QPushButton("保存")
         self.btn_save.setObjectName("primary")
         self.btn_save.setDefault(True)
-        self.btn_save.clicked.connect(self.accept)
+        self.btn_save.clicked.connect(self.save_requested.emit)
         footer = QWidget()
         footer.setObjectName("dialogFooter")
         footer_lay = QHBoxLayout(footer)
@@ -2253,7 +2254,7 @@ class SettingsDialog(QDialog):
         self.set_models(self._models)
         self.model_info.setText(f"<small>{html.escape(model)} 实测平均 {result:.2f}s（已记入统计）</small>")
 
-    def apply(self) -> None:
+    def apply(self, *, hotkeys: dict[str, str] | None = None) -> None:
         s = self.s
         s.loopback_device = self.speaker.currentData()
         s.duplex_capture_device = self.capture_speaker.currentData()
@@ -2286,9 +2287,15 @@ class SettingsDialog(QDialog):
         s.opacity = self.opacity.value()
         s.show_overlay = self.show_overlay.isChecked()
         s.subtitle_mode = self.subtitle_mode.isChecked()
-        s.hotkey = self.hotkey.text().strip() or s.hotkey
-        s.selection_hotkey = self.selection_hotkey.text().strip() or s.selection_hotkey
-        s.screenshot_hotkey = self.screenshot_hotkey.text().strip() or s.screenshot_hotkey
+        if hotkeys is None:
+            hotkeys = {
+                "hotkey": self.hotkey.text().strip() or s.hotkey,
+                "selection_hotkey": self.selection_hotkey.text().strip() or s.selection_hotkey,
+                "screenshot_hotkey": self.screenshot_hotkey.text().strip() or s.screenshot_hotkey,
+            }
+        s.hotkey = hotkeys["hotkey"]
+        s.selection_hotkey = hotkeys["selection_hotkey"]
+        s.screenshot_hotkey = hotkeys["screenshot_hotkey"]
         s.selection_font_family = self.selection_font_family.currentFont().family()
         s.selection_chinese_px = self.chinese_size.value()
         s.selection_chinese_color = self.chinese_color.color()

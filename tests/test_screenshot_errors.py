@@ -254,10 +254,10 @@ def test_unconfigured_translation_service_gives_the_same_hint_as_selection(app):
     assert shot_popup[:2] == sel_popup[:2]
 
 
-# ---- 热键注册失败：与划词一致的提示 ----
+# ---- 热键注册失败：提示对应功能及快捷键 ----
 
 
-def test_screenshot_hotkey_conflict_shows_the_same_status_as_selection(monkeypatch, app):
+def test_hotkey_registration_failure_names_the_feature_and_keeps_the_old_registration(monkeypatch, app):
     conflict = "快捷键 Alt+N 已被其他程序占用"
     monkeypatch.setattr(app_module, "GlobalHotkey", lambda spec, cb: FakeGlobalHotkey(spec, cb, error=conflict))
     app.bridge = SimpleNamespace(screenshot_hotkey=FakeSignal(), selection_hotkey=FakeSignal())
@@ -265,11 +265,12 @@ def test_screenshot_hotkey_conflict_shows_the_same_status_as_selection(monkeypat
     app.selection_hotkey = None
 
     app._register_screenshot_hotkey()
-    assert app.status_messages == [conflict]
+    assert app.status_messages == [f"截图翻译快捷键注册失败：{conflict}"]
+    assert app.screenshot_hotkey is None
 
     conflict_sel = "快捷键 Alt+M 已被其他程序占用"
     monkeypatch.setattr(app_module, "GlobalHotkey", lambda spec, cb: FakeGlobalHotkey(spec, cb, error=conflict_sel))
     app.status_messages.clear()
     app._register_selection_hotkey()
-    assert app.status_messages == [conflict_sel]
-    assert app.screenshot_hotkey is not None  # 注册失败不影响对象存在，程序继续运行
+    assert app.status_messages == [f"划词翻译快捷键注册失败：{conflict_sel}"]
+    assert app.selection_hotkey is None
