@@ -92,7 +92,7 @@ An unauthenticated launch shows a guide with two options:
 | 02 Selection translation | Alt+M | `selection_hotkey` |
 | 03 Screenshot translation | Alt+N | `screenshot_hotkey` |
 
-All of these can be changed in settings. Voice interpretation has no separate global hotkey.
+All of these can be changed in settings. Voice interpretation has no separate global hotkey. When changing shortcuts, choose different combinations for the three features; a change that creates an in-app duplicate is rejected and the dialog stays open. If Windows cannot register a new shortcut (for example, because another app owns it), that shortcut keeps its previous value while other valid settings are saved.
 
 ### Running a meeting
 
