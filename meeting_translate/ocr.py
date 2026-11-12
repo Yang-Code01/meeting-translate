@@ -14,11 +14,11 @@ from PySide6.QtGui import QImage
 from .capture import image_to_rgb_array
 from .ocr_layout import compose_text
 
-# 只能在构造 RapidOCR 时设置：线程数 4、检测边长按 max 限制到 960（混合核 CPU 上避免性能退化）。
+# 只能在构造 RapidOCR 时设置：线程数 4、检测边长按 max 限制到 1280（提高小字检测率）。
 # 不传 lang_type：small 模型对日文与默认配置结果相同。
 OCR_PARAMS = {
     "Det.limit_type": "max",
-    "Det.limit_side_len": 960,
+    "Det.limit_side_len": 1280,
     "EngineConfig.onnxruntime.intra_op_num_threads": 4,
 }
 

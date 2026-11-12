@@ -74,7 +74,7 @@ def test_rapidocr_is_built_once_with_thread_count_and_detection_limits(monkeypat
     assert engine.recognize(blank()) == []
     assert built["params"] == {
         "Det.limit_type": "max",
-        "Det.limit_side_len": 960,
+        "Det.limit_side_len": 1280,
         "EngineConfig.onnxruntime.intra_op_num_threads": 4,
     }
     assert built["shape"] == (20, 40, 3)
