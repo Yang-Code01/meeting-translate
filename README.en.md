@@ -27,7 +27,7 @@ No platform lock-in (Teams / Zoom / Webex / Meet / Tencent Meeting all work). Th
 
 ### Option 1: Download the packaged exe
 
-1. Grab `MeetingTranslate.exe` (about 400 MB, with recognition models and the Copilot runtime bundled) from [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest).
+1. Grab `MeetingTranslate.exe` (about 520 MB, with recognition models, OCR models, and the Copilot runtime bundled) from [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest).
 2. Run it. The first launch unpacks bundled resources (~15 s, with a splash screen); a 「译」 tray icon appears when ready.
 3. Log in to Copilot on first use — see [Sign in](#sign-in-to-copilot) — or enter your own API key in Settings.
 
@@ -242,7 +242,7 @@ After a meeting only Markdown remains: `<meeting start time>.md` and `<title>_<t
 - The default Copilot path needs a subscription and is billed in AIC / requests; a custom endpoint is billed in tokens, with the quota set by the provider.
 - The default SenseVoice engine has no hotword support; switch to ReazonSpeech (slower) if you need it.
 - Speaker separation only distinguishes *them* / *you*; multiple people in one room are not separated.
-- The exe is ~400 MB and needs unpacking on launch (~15 s on first run).
+- The exe is ~520 MB and needs unpacking on launch (~15 s on first run).
 - Pausing force-finalizes the current sentence, so pausing mid-sentence can truncate it.
 
 ## Technical notes

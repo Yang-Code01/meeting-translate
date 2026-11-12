@@ -27,7 +27,7 @@ Windows 桌面小工具，提供四个入口（编号与首页一致）：
 
 ### 方式一：下载打包好的 exe
 
-1. 到 [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest) 下载 `MeetingTranslate.exe`（约 400 MB，内置识别模型与 Copilot 运行时）。
+1. 到 [Releases](https://github.com/Yang-Code01/meeting-translate/releases/latest) 下载 `MeetingTranslate.exe`（约 520 MB，内置识别模型、OCR 模型与 Copilot 运行时）。
 2. 双击运行。首次启动要解压内置资源，约 15 秒（期间显示启动画面）；就绪后右下角出现「译」托盘图标。
 3. 首次使用需登录 Copilot（见下方[登录](#登录-copilot)），或在设置里改用自己的 API key。
 
@@ -245,7 +245,7 @@ uv sync --index-url https://pypi.org/simple --refresh
 - 默认走 Copilot 时需要订阅，额度按 AIC 与请求次数计；改用自定义端点后按 token 计费，额度由服务商决定。
 - 默认引擎 SenseVoice 不支持热词；需要热词请切到 ReazonSpeech（更慢一些）。
 - 说话人区分只做到「对方 / 我」两路，无法区分会议室里的多个人。
-- exe 约 400 MB，启动要解压，首启约 15 秒。
+- exe 约 520 MB，启动要解压，首启约 15 秒。
 - 暂停会强制把当前句子定稿，句中暂停可能截断半句。
 
 ## 技术要点
